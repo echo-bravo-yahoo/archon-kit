@@ -1,0 +1,13 @@
+# The per-run config layer for Codex: `archon workflow run <workflow> --config <this file>`, or
+# `archon-kit run codex <workflow>`. It sets the provider and all three tiers, because a layer for
+# one run has to win over an install that pins Claude models, and it turns on live web search,
+# which the research workflow uses. The model names are the Archon 0.13.2 built-ins; `archon ai
+# tier list` shows the current ones. Codex needs the provider plugin (`archon provider add codex`).
+assistant: codex
+tiers:
+  small: { provider: codex, model: gpt-5.6-luna }
+  medium: { provider: codex, model: gpt-5.6-terra }
+  large: { provider: codex, model: gpt-5.6-sol }
+assistants:
+  codex:
+    webSearchMode: live

@@ -1,0 +1,359 @@
+name: research
+description: |
+  Research a question about this repository or its domain, or why something is
+  failing, and write a report, changing nothing, then pause with a link to the
+  report as a page. The run reads the tip of the local base branch, not a lagging
+  origin/<base>. Answer the pause by closing the run, by sending the research
+  further with your note (another round that rewrites or extends the report to fit
+  your note, then another pause), or by starting the follow-up workflows the research proposes, up
+  to five (build here or in another repository, check-later for a claim to
+  re-verify later, a hand-off the repository declares in .archon/build.json, such as
+  deploy-staging, or a global hand-off from the kit's kit.json that starts in another
+  repository) with your note and the report as each one's brief.
+  Use when: a question needs answering before anyone decides whether there is
+  work in it — what a library supports, how a subsystem behaves, what options
+  exist — or something is failing and the cause is not yet known.
+  Do not use when: the work is already decided (build).
+
+# The pause sits inside a loop_group, so the loop settles one round late for the reasons
+# in build.yaml's header comment: the first node of each round reads the previous round's
+# answer through $LOOP_PREV, records it in files, and prints `idle` to switch the rest of
+# the round off. A loop_group that runs out of iterations fails the run, so the limit
+# allows 19 rounds of research and the settling round.
+nodes:
+  # Archon cuts a run's worktree from origin/<base>, which can lag the local branch. This run
+  # changes nothing, so it reads the local tip detached, the tree a build would plan against.
+  # The node's whole output is the base branch name.
+  - id: sync_base
+    bash: |
+      set -uo pipefail
+      settings="${ARCHON_HOME:-$HOME/.archon}/scripts/build-settings.sh"
+      main=$("$settings" --main-worktree) || exit 1
+      base=$(cd "$main" && "$settings" base) || exit 1
+      if git rev-parse --verify -q "refs/heads/$base" > /dev/null; then
+        git checkout -q --detach "$base" >&2 || exit 1
+      fi
+      printf '%s\n' "$base"
+
+  # The workflows the researcher may propose as the follow-up: `build` here and in each other
+  # repository where it can start, the global hand-offs of kit.json that are available, the
+  # hand-offs the repository declares in .archon/build.json, and `check-later` in a git
+  # repository.
+  - id: candidates
+    bash: |
+      set -uo pipefail
+      "${ARCHON_HOME:-$HOME/.archon}/scripts/start-run.sh" candidates --also build
+    mutates_checkout: false
+
+  - id: research_cycle
+    depends_on: [candidates, sync_base]
+    loop_group:
+      max_iterations: 20
+      fresh_context: true
+      until_bash: 'grep -qx settled "$ARTIFACTS_DIR/research-loop.txt"'
+      nodes:
+        # steer.md, which holds the owner's notes in order, exists from the second round on.
+        - id: round
+          bash: |
+            set -uo pipefail
+            prev=$LOOP_PREV.round.output
+            d=$LOOP_PREV.notice.output.decision
+            note=$LOOP_PREV.notice.output.text
+            if [ -z "$prev" ] || [ "$d" = dig-deeper ]; then
+              if [ -n "$prev" ]; then
+                {
+                  printf '## Note\n\n'
+                  if [ -n "$note" ]; then
+                    printf '%s\n\n' "$note"
+                  else
+                    printf 'No note: settle the open questions the report lists.\n\n'
+                  fi
+                } >> "$ARTIFACTS_DIR/steer.md"
+              fi
+              printf 'open\n' > "$ARTIFACTS_DIR/research-loop.txt"
+              printf 'research\n'
+            else
+              [ -n "$d" ] || d=close
+              printf '%s\n' "$d" > "$ARTIFACTS_DIR/decision.txt"
+              printf '%s' "$note" > "$ARTIFACTS_DIR/note.txt"
+              printf 'settled\n' > "$ARTIFACTS_DIR/research-loop.txt"
+              printf 'idle\n'
+            fi
+          mutates_checkout: false
+
+        - id: research
+          depends_on: [round]
+          when: "$round.output == 'research'"
+          model: medium
+          prompt: |
+            Research the question below. Read the repository's CLAUDE.md if it has one.
+
+            Answer from evidence: the code, its history, its docs, and the web where the
+            question reaches past the repository. Cite each claim's source as a file and
+            line, a commit, or a URL. Separate what you confirmed from what you inferred.
+
+            Read the source, not only the docs and the entry points. For each system the
+            question involves, trace how data moves from where it is produced to where it
+            is used: the file and function at each step, the format at each hop, and what
+            triggers each step. When the path leaves this repository, follow it into the
+            other repositories under ~/workspace and, with read-only commands, onto the
+            hosts that run them. When the question is about adding to or changing a
+            system, name the extension points: where a new piece would attach, what
+            already exists to reuse, and what has to change first.
+
+            Before you list anything as an open question, try to settle it by reading
+            more source or running a read-only command. List only what needs a person's
+            decision, a measurement or a live change, and say which.
+
+            When the question describes a failure, find the cause rather than listing
+            facts. Follow the evidence to the cause whose fix prevents the symptom, not
+            to the first thing that looks wrong. Read the code, the history and whatever
+            logs or output the failure points at. Reproduce it when you can do so without
+            changing a tracked file, and say how. State which links in the chain you
+            proved and which you only inferred, rather than presenting the whole chain at
+            one confidence. The report then gives the symptom, the evidence, the causal
+            chain from cause to symptom, what you ruled out and why, and the smallest
+            change that would fix it, with file and line numbers. Return `confidence` as
+            `confirmed` when every link is proved, `likely` when a link is inferred, and
+            `unsettled` when the cause is not established.
+
+            If $ARTIFACTS_DIR/steer.md exists, an earlier round of this run already wrote
+            $ARTIFACTS_DIR/report.md, and the owner read it as a page and sent the research
+            further. steer.md holds the owner's notes, newest last. Read the report, then
+            classify the newest note. A note about the report's shape, lead, framing or
+            audience means you first copy report.md to $ARTIFACTS_DIR/rounds/<n>.md, where
+            <n> is the number of files already there plus one, then rewrite the report from
+            the top around the note: keep the verified findings and their evidence, and drop
+            whatever the new framing makes irrelevant. A note that asks for more findings
+            means you research them and extend the report with the findings in the sections
+            they belong to. A note that does both gets both. After every round, change the
+            sections the newest note bears on, so that the answer to the note is in the body
+            of the report and not only in a line about the note. Then add one line to a
+            `## Rounds` section at the end of the report, which names the note in a few words
+            and the sections that changed, such as "Round 2: asked why the file is protected;
+            rewrote Answer and Evidence", and keep every earlier line of that section. The
+            first round writes no `## Rounds` section. The report stays one report that
+            answers the question and every note.
+
+            Write $ARTIFACTS_DIR/report.md. The owner opens it as a web page and sees nothing
+            else from this run, so it holds every finding. Begin with `# <a short title for
+            the question>`. When the findings suggest work, next comes a recommended course of
+            action section that says what to do and why. Then the answer in a few sentences,
+            then the question as asked, how the data flows, the extension points, the evidence, the open questions,
+            any work the findings suggest and, from the second round on, `Rounds`. Leave out a section
+            the question does not call for. A later run may be handed this report as its brief, so name files and line
+            numbers, and leave out the value of any secret.
+
+            When an open question can only be settled by measuring or trying something on
+            the real system, the report says what is already known, which experiment settles
+            each unknown (what to try and what each outcome means), and what to build
+            depending on the result. Propose a `build` follow-up for it with `interactive`
+            set to `yes`, whose `note` says what the experiment records and to record the
+            result where the repository's CLAUDE.md designates, or else in the build's
+            report page.
+
+            The page shows Markdown only, so raw HTML in the report appears as text. Put a
+            graphic or other supporting file in $ARTIFACTS_DIR/files/ and link it from the
+            report as files/<name>.
+
+            Return `slug`, two to five lowercase words joined by hyphens that name what was
+            researched, such as 'retry-test-overlap'. It becomes the report's address.
+
+            Return `follow_ups`, the workflows that should follow this research, one entry for
+            each, chosen from this list with the inputs each one asks for and a `note` for it:
+            $candidates.output
+            Before you set `repo` on any entry, check each file the work touches. For each file,
+            list the tracked files of this repository and of the candidate repository with a
+            read-only command: `git -C <checkout> ls-files -- <path>` (use `<dir>/` for a
+            directory, and never list a whole repository). This repository's checkout is the
+            output of `build-settings.sh --main-worktree`, and a candidate's is
+            `<workspace>/<name>`, where the workspace is the output of `kit-settings.sh
+            workspace`; both scripts are in the `scripts` directory of the Archon home. A file that this
+            repository tracks belongs to this repository and `repo` stays empty, even when the
+            first directory of its path is the same as the name of a repository in the list, such
+            as `api/handler.js` in a repository that has an `api/` directory while a separate
+            repository named `api` is a candidate. Set `repo` only for files that are tracked in
+            the candidate and not in this repository, and say in the entry's `note`, in one
+            clause, which evidence you found, for example that the path is tracked in the named
+            repository.
+            Choose `build` with `repo` empty only when every file the work touches is tracked
+            in this repository, because a build changes and lands only the files of the
+            repository it runs in. When the files are tracked in another repository in the list
+            above, choose `build` and set `repo` to the name the list gives, and name each file
+            by its path inside that repository. Add the input `interactive` with the value `yes`
+            to a `build` entry when its findings call for an experiment or a choice that only the
+            owner can make partway through, such as a build that has to run in staging before
+            the next step is known. The implementer may then stop and ask the owner, after it
+            starts a hand-off such as `deploy-staging`, so say in that entry's `note` what the owner has to
+            try or choose. Leave the input out when the build needs no one. A line of the list
+            that says where the workflow starts (`It starts in the <name> repository`) is a
+            global hand-off: choose it when the files are ones that line's `use_when` text covers,
+            leave `repo` empty, and name each file by its path inside the repository the line
+            names. When the chosen hand-off runs no tests, end the report with a section that
+            lists the commands the owner runs before approving it. Choose `check-later` when the research leaves a claim to
+            re-verify later, such as that a cause stays fixed. Give `when` as a relative time
+            and a `claim` that can be checked from the repository. It can accompany a `build`
+            follow-up. The owner's steering comes first: the question the run started with,
+            notes in steer.md, and what the owner said at a pause. When it says how to divide the
+            follow-ups (fan out, combine, take one part), do that; a dig-deeper note about
+            the division reshapes `follow_ups`. Without steering, one run is one conceptual task:
+            work someone would do, review and land as one unit, however many files, directories
+            or layers it touches. Do not split a task along those lines and do not merge unrelated
+            tasks to save runs. Return one entry for each task, at most five. When the findings
+            hold more than five tasks, end the report with a `## Not taken this run` section,
+            one line per task left out. A build changes and lands only the repository it runs in,
+            so one task spanning repositories gets one follow-up entry for each repository, and
+            each `note` says it is part of one task and what the other entries cover. For files in a repository the list does not show, or a host file
+            nothing mirrors, return no entry for them and end the report with a section that
+            names those files and says what is missing. Choose a listed hand-off, such as
+            `deploy-staging`, when the finding is that something only has to be deployed or
+            installed. Return an empty array when no file can be changed by a listed
+            workflow. The owner confirms the choice at the pause.
+
+            Change nothing inside the repository. Write only under $ARTIFACTS_DIR. Return
+            only the structured fields.
+
+            Question:
+            $ARGUMENTS
+          allowed_tools: [Read, Grep, Glob, Bash, Write, WebSearch, WebFetch]
+          mutates_checkout: false
+          output_format:
+            type: object
+            properties:
+              confidence: { type: string, enum: [confirmed, likely, unsettled] }
+              title:
+                type: string
+                description: "A short imperative title for the work the findings suggest, such as 'Add a dark-mode token set'; 'Act on research findings' when they suggest none"
+              slug:
+                type: string
+                description: "two to five lowercase words joined by hyphens that name what was researched, such as 'retry-test-overlap'"
+              follow_ups:
+                type: array
+                maxItems: 5
+                items:
+                  type: object
+                  properties:
+                    workflow: { type: string }
+                    repo:
+                      type: string
+                      description: "the name of another repository under the workspace in which `build` should run, or an empty string for this repository"
+                    inputs:
+                      type: array
+                      items:
+                        type: object
+                        properties: { name: { type: string }, value: { type: string } }
+                        required: [name, value]
+                    note: { type: string }
+                  required: [workflow, repo, inputs, note]
+            required: [confidence, title, slug, follow_ups]
+
+        # The follow-ups the pause will start: the researcher's proposal, checked against the
+        # candidates (`start-run.sh check` drops an undeclared workflow, a wrong input, a
+        # repository `build` cannot start in, a repeat and anything past the fifth, with a line
+        # on stderr). The plan is empty, and the pause says `nothing`, when the researcher
+        # proposed none or none is valid, which respects the prompt's empty array for findings
+        # that no listed workflow can act on. Each round rewrites the plan, and `follow_up` reads
+        # the last one. The pause names it, because a wait node's text resolves node outputs and
+        # not files.
+        - id: follow_plan
+          depends_on: [research]
+          when: "$round.output == 'research'"
+          bash: |
+            set -uo pipefail
+            r=$research.output
+            f="$ARTIFACTS_DIR"
+            proposed=$(printf '%s' "$r" | jq -c '[.follow_ups[]? | select((.workflow // "") != "")]' 2> /dev/null || printf '[]')
+            printf '%s' "$proposed" | "${ARCHON_HOME:-$HOME/.archon}/scripts/start-run.sh" check --also build - > "$f/follow-up-plan.json" \
+              || printf '[]\n' > "$f/follow-up-plan.json"
+            n=$(jq 'length' "$f/follow-up-plan.json" 2> /dev/null || echo 0)
+            if [ "${n:-0}" -eq 0 ]; then
+              printf '[]\n' > "$f/follow-up-plan.json"
+              printf 'nothing (no workflow was proposed)\n'
+              exit 0
+            fi
+            jq -r 'map("\(.workflow)\(if (.repo // "") != "" then " in \(.repo)" else "" end) \(.inputs | map("\(.name)=\(.value)") | join(" "))" | rtrimstr(" ")) | join(", ")' "$f/follow-up-plan.json"
+          mutates_checkout: false
+
+        # report.sh builds the page: the repository's report_cmd when it has one and accepts
+        # `research`, else the kit's page, else a plain one, so no repository needs a builder. The
+        # report.sh runs from the main worktree, so the repository's builder is found there: this run's
+        # worktree is cut from origin/<branch>, which can lag local main and lack the builder. Each round rebuilds
+        # the same page, so the link stays the same: slug.sh keeps the first round's slug in slug.txt. The slug
+        # is the researcher's `slug` field, else the question's words. When every builder fails, the line is a
+        # sentence and the pause still happens. A wait node's attention text does not resolve
+        # $ARTIFACTS_DIR, so the notice reads the link from here.
+        - id: report_page
+          depends_on: [research, follow_plan]
+          when: "$round.output == 'research'"
+          bash: |
+            set -uo pipefail
+            f="$ARTIFACTS_DIR/report.md"
+            [ -s "$f" ] || { printf 'research wrote no report at %s\n' "$f" >&2; exit 1; }
+            msg=$ARGUMENTS
+            spec=$research.output
+            printf '%s' "$spec" > "$ARTIFACTS_DIR/research.json"
+            run=$(basename "$ARTIFACTS_DIR")
+            settings="${ARCHON_HOME:-$HOME/.archon}/scripts/build-settings.sh"
+            repo=$("$settings" --repo) || exit 1
+            slug=$(bash "${ARCHON_HOME:-$HOME/.archon}/scripts/slug.sh" make --run "$run" --prefix research \
+              --model "$(printf '%s' "$spec" | jq -r '.slug // empty' 2> /dev/null)" --text "$msg" --keep "$ARTIFACTS_DIR/slug.txt") || exit 1
+            dir="${ARCHON_HOME:-$HOME/.archon}/designs/$repo/$slug"
+            out="$dir/index.html"
+            main=$("$settings" --main-worktree) || exit 1
+            link=$(cd "$main" && bash "${ARCHON_HOME:-$HOME/.archon}/scripts/report.sh" page research \
+              --out "$out" --design "$slug" --run "$run" --artifacts "$ARTIFACTS_DIR" --spec "$ARTIFACTS_DIR/research.json")
+            if [ -s "$out" ] && [ -d "$ARTIFACTS_DIR/files" ]; then
+              mkdir -p "$dir/files" && cp -R "$ARTIFACTS_DIR/files/." "$dir/files/"
+            fi
+            printf '%s\n' "$link"
+          mutates_checkout: false
+
+        - id: notice
+          depends_on: [report_page, follow_plan]
+          when: "$round.output == 'research'"
+          wait:
+            attention: |
+              $report_page.output
+              Research finished ($research.output.confidence). follow-up starts: $follow_plan.output.
+              Answer dig-deeper with a note to change it.
+            form: select
+            options:
+              - { id: close, label: "Noted, close this" }
+              - { id: dig-deeper, label: "Research further with my note" }
+              - { id: follow-up, label: "Start the follow-up with my note" }
+
+  - id: decision
+    depends_on: [research_cycle]
+    bash: cat "$ARTIFACTS_DIR/decision.txt"
+    mutates_checkout: false
+
+  # The note leads the brief because it is the person's steer on the report
+  # beneath it. Each follow-up workflow starts from its repository's own checkout (this
+  # project's, another repository's, or the repository a global hand-off names), not this
+  # run's worktree, so it gets a fresh worktree of its own, and its message is the brief
+  # followed by its entry's note. Archon cuts that worktree, so a
+  # workflow that takes `ref` receives the commit the base branch holds in the main checkout,
+  # which includes work that landed there and was never pushed.
+  - id: follow_up
+    depends_on: [decision]
+    when: "$decision.output == 'follow-up'"
+    bash: |
+      set -euo pipefail
+      [ "$(jq 'length' "$ARTIFACTS_DIR/follow-up-plan.json" 2> /dev/null || echo 0)" -gt 0 ] || { printf 'no follow-up was proposed, so none started\n'; exit 0; }
+      note=$(cat "$ARTIFACTS_DIR/note.txt")
+      title=$(jq -r '.title' "$ARTIFACTS_DIR/research.json")
+      report="$ARTIFACTS_DIR/report.md"
+      brief="$ARTIFACTS_DIR/brief.md"
+      {
+        printf '# %s\n\n' "$title"
+        if [ -n "$note" ]; then printf '## Note\n\n%s\n\n' "$note"; fi
+        printf '## Research\n\n'
+        cat "$report"
+      } > "$brief"
+      settings="${ARCHON_HOME:-$HOME/.archon}/scripts/build-settings.sh"
+      repo=$("$settings" --main-worktree)
+      base=$(cd "$repo" && "$settings" base)
+      sha=$(git -C "$repo" rev-parse "$base")
+      "${ARCHON_HOME:-$HOME/.archon}/scripts/start-run.sh" start --strict "$ARTIFACTS_DIR/follow-up-plan.json" "$sha" "$brief"
+      printf 'brief: %s\n' "$brief"
+    mutates_checkout: false

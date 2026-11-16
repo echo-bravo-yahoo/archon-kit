@@ -1,0 +1,187 @@
+#!/bin/bash
+# Land worktree commits onto the main branch.
+# Cherry-picks all commits from the worktree branch that aren't on main,
+# then resets the worktree branch to main.
+#
+# Must be run from inside a git worktree (not the main worktree).
+
+set -euo pipefail
+
+die() { echo "error: $1" >&2; exit 1; }
+
+# Every write to the main checkout goes through git-retry, which waits out another process's
+# index.lock or ref lock instead of failing at once. A lock failure here would otherwise show
+# as a cherry-pick conflict, or leave a stash behind unpopped.
+GIT_RETRY="$(dirname "$(readlink -f "$0")")/git-retry"
+
+usage() {
+  cat <<'EOF'
+Usage: worktree-land
+
+Land worktree commits onto the main branch.
+
+Cherry-picks every commit from the current worktree branch that isn't on
+main, then resets the worktree branch to match main. Must be run from
+inside a git worktree (not the main worktree). Takes no arguments.
+
+Options:
+  -h, --help    Show this help and exit
+EOF
+}
+
+# Parse args: only -h/--help is accepted; anything else is an error.
+case "${1:-}" in
+  -h|--help|-\?) usage; exit 0 ;;
+  '') ;;
+  *) usage >&2; die "unexpected argument: $1" ;;
+esac
+
+# 1. Check worktree is clean
+[[ -z "$(git status --porcelain)" ]] ||
+  die "Worktree has uncommitted changes. Commit or drop them first."
+
+# 2. Validate: must be in a worktree, not the main worktree
+TOPLEVEL=$(git rev-parse --show-toplevel)
+# The main worktree is the first entry. This awk and the one in step 3 read the list to its end:
+# a reader that exits early closes the pipe while git is still writing, and under pipefail git's
+# SIGPIPE ends the script with status 141 once the list is longer than one 4096-byte write.
+MAIN_PATH=$(git worktree list --porcelain | awk '/^worktree / && !seen { sub(/^worktree /, ""); print; seen = 1 }')
+
+git_dir=$(git rev-parse --git-dir)
+case "$git_dir" in
+  *.git/worktrees/*)  ;; # in a worktree
+  *)
+    if [[ "$TOPLEVEL" = "$MAIN_PATH" ]]; then
+      die "Not in a worktree (in repo root). Run this script from a worktree."
+    else
+      die "Not in a worktree. Run this script from a worktree."
+    fi
+    ;;
+esac
+
+# 3. Find main branch: whatever the main worktree has checked out, since step 7 cherry-picks
+# there and step 9 resets to it. The first porcelain block is the main worktree, so a detached
+# main worktree (no branch line) must not fall through to another worktree's branch.
+MAIN_BRANCH=$(git worktree list --porcelain | awk 'NF==0{done=1} !done && /^branch /{sub("refs/heads/","",$2); print $2}')
+[[ -n "$MAIN_BRANCH" ]] ||
+  die "The main worktree at $MAIN_PATH has a detached HEAD. Check out its branch and retry."
+
+# 4. Find commits to land
+COMMITS=$(git log --oneline --reverse "$MAIN_BRANCH..HEAD")
+if [[ -z "$COMMITS" ]]; then
+  die "No commits to land (worktree branch is up to date with $MAIN_BRANCH)."
+fi
+
+COMMIT_COUNT=$(echo "$COMMITS" | wc -l | tr -d ' ')
+echo "Landing $COMMIT_COUNT commit(s) onto $MAIN_BRANCH:"
+echo "$COMMITS"
+echo
+
+# 5. Rebase onto main
+if ! git rebase "$MAIN_BRANCH" >/dev/null 2>&1; then
+  git rebase --abort 2>/dev/null || true
+  die "Rebase onto $MAIN_BRANCH failed — aborted. Resolve conflicts manually and retry."
+fi
+
+# Re-read commit SHAs after rebase (they changed)
+SHAS=$(git log --format='%H' --reverse "$MAIN_BRANCH..HEAD")
+HEAD_SHA=$(git rev-parse HEAD)
+
+# 6. Stash main if dirty. --untracked-files=no because plain `git stash` saves
+# only tracked changes: an untracked-only tree would set the flag, stash
+# nothing, and leave step 8 popping whatever stash happened to be on top.
+STASH_REF=""
+if [[ -n "$(git -C "$MAIN_PATH" status --porcelain --untracked-files=no)" ]]; then
+  if stash_out=$("$GIT_RETRY" git -C "$MAIN_PATH" stash push -m "worktree-land $$" 2>&1); then
+    STASH_REF=$(git -C "$MAIN_PATH" rev-parse -q --verify 'stash@{0}' || true)
+  else
+    echo "warning: could not stash the changes in $MAIN_PATH: $stash_out" >&2
+  fi
+fi
+
+# Pop only the stash this script pushed. Anything else on top of the stack
+# belongs to someone else, and popping it would apply unrelated work to main.
+restore_stash() {
+  [[ -n "$STASH_REF" ]] || return 0
+  local top
+  top=$(git -C "$MAIN_PATH" rev-parse -q --verify 'stash@{0}' || true)
+  if [[ "$top" != "$STASH_REF" ]]; then
+    echo "warning: stash@{0} is not the stash worktree-land created; leaving it alone" >&2
+    return 0
+  fi
+  if ! pop_out=$("$GIT_RETRY" git -C "$MAIN_PATH" stash pop 2>&1); then
+    echo "warning: could not pop the stash worktree-land made of the changes in $MAIN_PATH; they are still in stash@{0}: $pop_out" >&2
+  fi
+  STASH_REF=""
+}
+
+# 6b. Untracked files in main that the incoming commits would create abort a
+# cherry-pick (the stash above only covers tracked changes). A tool that
+# copies files into main's tree routinely leaves such files, so a
+# colliding untracked file whose content is byte-identical to the branch
+# tip's copy is a stale copy: safe to remove, the commit recreates it
+# tracked. Different content is a real conflict - abort before touching main.
+#
+# The path list comes from `git log --name-only` per commit rather than a
+# `git diff-tree` over all of $SHAS at once: diff-tree across more than two
+# trees is a combined diff, which omits paths only one commit touched, so it
+# under-reports exactly the collisions this step exists to clear.
+CONFLICTS=""
+while IFS= read -r p; do
+  [[ -n "$p" && -f "$MAIN_PATH/$p" ]] || continue
+  git -C "$MAIN_PATH" ls-files --error-unmatch "$p" >/dev/null 2>&1 && continue  # tracked: stash handled it
+  # Every blob this range ever wrote at $p, not just the tip's. A path the
+  # branch adds and later deletes has no blob at the tip, yet the cherry-pick
+  # replays commit by commit and still recreates it, so comparing against the
+  # tip alone would either miss a stale copy or abort on a real collision
+  # with a misleading reason.
+  branch_blobs=$(
+    for c in $(git rev-list "$MAIN_BRANCH".."$HEAD_SHA" -- "$p"); do
+      git rev-parse "$c:$p" 2>/dev/null || true
+    done
+  )
+  if [[ "$branch_blobs" == *"$(git hash-object "$MAIN_PATH/$p")"* ]]; then
+    rm "$MAIN_PATH/$p"
+    echo "cleared stale untracked copy: $p"
+  else
+    CONFLICTS+="  $p"$'\n'
+  fi
+done < <(git log --format='' --name-only "$MAIN_BRANCH".."$HEAD_SHA" | sed '/^$/d' | sort -u)
+if [[ -n "$CONFLICTS" ]]; then
+  restore_stash
+  die "Untracked files in $MAIN_PATH collide with these commits and match no version the commits write:
+$CONFLICTS
+Reconcile or remove them, then retry."
+fi
+
+# 7. Cherry-pick onto main
+pick_tries=0
+# A lock failure stops the pick before it changes anything, and a conflict stops it part-way,
+# so each attempt starts from a clean main: abort, then retry only when a lock was the cause.
+# shellcheck disable=SC2086  # SHAS is intentionally word-split
+while :; do
+  pick_out=$("$GIT_RETRY" --wait 0 git -C "$MAIN_PATH" cherry-pick $SHAS 2>&1) && break
+  pick_rc=$?
+  "$GIT_RETRY" git -C "$MAIN_PATH" cherry-pick --abort >/dev/null 2>&1 || true
+  if [[ $pick_rc -eq 75 ]] && (( ++pick_tries < 40 )); then sleep 1; continue; fi
+  restore_stash
+  die "Cherry-pick failed — aborted to restore main. Untracked-file collisions are pre-checked above, so look for content conflicts: git -C $MAIN_PATH status
+$pick_out"
+done
+
+# 8. Pop stash
+restore_stash
+
+# 9. Reset worktree branch to main
+git reset --hard "$MAIN_BRANCH" >/dev/null 2>&1
+
+# Deliberately does not remove the worktree: this script requires being run
+# from inside it (step 2), so the invoking shell's cwd is always inside
+# $TOPLEVEL right here. An unconditional removal at this point either fails
+# (Claude Code locks a worktree a session is running from, aborting after
+# the land already succeeded) or succeeds and deletes the directory the
+# shell is standing in, breaking every later command in that session.
+# Removal belongs to a separate step taken after leaving the worktree --
+# worktree-cleanup.sh checks merge status and uncommitted/untracked
+# content before deleting, which this unconditional last line never did.
+echo "Landed on $MAIN_BRANCH. Worktree at $TOPLEVEL is fully merged. From outside it, remove it with: worktree-cleanup.sh remove \"$TOPLEVEL\"."

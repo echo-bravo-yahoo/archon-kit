@@ -1,0 +1,9 @@
+# The target needs no confirmation, so the run publishes and checks the result. The stubs stand in
+# for the commands; `publish-workflow.test.mjs` proves `resolve`.
+fixture:
+  expect: completed
+  reached: [resolve, run, verify]
+  inputs: { target: docs-site }
+resolve: go
+run: published
+verify: no check declared

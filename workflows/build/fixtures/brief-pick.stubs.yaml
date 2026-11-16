@@ -1,0 +1,61 @@
+# A brief whose plan builds a page of options and asks the owner to choose. The pause links
+# the page, the owner answers, and the build then goes through to the landing.
+fixture:
+  expect: completed
+  reached: [reuse, build_go, repair_ready, repair_state, report_pick, report, plan_gate, tests, red_check, implement, gates, shots, sync_start, sync_gates, sync_land, cleanup]
+  inputs: { design: platform-icons }
+  resolved-text-contains:
+    plan_gate: plan-report
+    final_gate: waits for you to land it
+sync_base: main
+settings: docs/briefs
+slug_source: given
+intake: platform-icons
+brief_location: docs/briefs/platform-icons
+gates_declared: "feature: npm run lint, npm test"
+lanes_declared: ":(glob)test/**"
+base_gates: green
+handoffs_declared: none declared
+plan_round: plan
+spec:
+  summary: Four variants of each of seven indicators.
+  files: [src/indicators.js]
+  needs_decision: true
+  question: Which variant of each indicator?
+  excuses: []
+  handoffs: []
+  gaps: []
+plan_record: ask
+plan_report: "https://reports.example.net/myrepo/platform-icons/plan-report"
+plan_gate: { decision: approve, text: "loading: b" }
+plan_decision: approve
+tests_go: run
+tests: wrote the tests
+red_check: red
+round: build
+impl_go: run
+implement: { ask: false, question: "", steps: "", handoffs: [] }
+impl_join: ok
+ask_mode: "no"
+plan_rules: none
+ask_check: go
+review_go: go
+review__scope: scoped
+review__review: { clean: true }
+review__verdict: clean
+gates: green
+reuse: fresh
+build_go: go
+repair_ready: no-repair
+repair_state: go
+ready: pause
+report_pick: { findings: "", open_items: [], summary: "Adds the change.", picks: [], extra_json: "" }
+report: "https://reports.example.net/myrepo/platform-icons/review-report\nplatform-icons is built, reviewed and green, and waits for you to land it."
+shots: ""
+final_gate: { decision: approve, text: "" }
+ship_decision: land
+sync_start: clean
+sync_gates: green
+sync_land: landed
+handoff: no hand-offs
+cleanup: landed on main; removed the worktree

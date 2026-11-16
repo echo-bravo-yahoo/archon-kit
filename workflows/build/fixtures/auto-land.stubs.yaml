@@ -1,0 +1,57 @@
+# With auto_land set in kit.json, a round that is green, reviewed clean and needs nothing from the
+# owner is `auto`: the report is built and printed, the final gate is skipped, and the commits
+# land. The dry run does one round, so it proves the routing and not the loop's settling, which
+# workflow-nodes.test.mjs proves for `round`.
+fixture:
+  expect: completed
+  reached: [sync_base, settings, reuse, ask_mode, plan_rules, ask_check, review_go, build_go, repair_ready, repair_state, report_pick, report, tests, red_check, implement, gates, shots, sync_start, sync_gates, sync_land, handoff, cleanup]
+  inputs: { design: timer }
+sync_base: main
+settings: docs/briefs
+slug_source: given
+intake: timer
+brief_location: docs/briefs/timer
+gates_declared: "feature: npm run lint, npm test"
+lanes_declared: ":(glob)test/**"
+base_gates: green
+handoffs_declared: none declared
+plan_round: plan
+spec:
+  summary: Adds the timer feature.
+  files: [src/feature.js]
+  needs_decision: false
+  question: ""
+  excuses: []
+  handoffs: []
+  gaps: []
+plan_record: no-ask
+plan_decision: approve
+tests_go: run
+tests: wrote the tests
+red_check: red
+round: build
+impl_go: run
+implement: { ask: false, question: "", steps: "", handoffs: [] }
+impl_join: ok
+ask_mode: "no"
+plan_rules: none
+ask_check: go
+review_go: go
+review__scope: scoped
+review__review: { clean: true }
+review__verdict: clean
+gates: green
+reuse: fresh
+build_go: go
+repair_ready: no-repair
+repair_state: go
+ready: auto
+report_pick: { findings: "", open_items: [], summary: "Adds the change.", picks: [], extra_json: "" }
+report: "https://reports.example.net/myrepo/timer/review-report\ntimer is built, reviewed and green. auto_land is set, so the run lands it without waiting."
+shots: ""
+ship_decision: land
+sync_start: clean
+sync_gates: green
+sync_land: landed
+handoff: no hand-offs
+cleanup: landed on main; removed the worktree

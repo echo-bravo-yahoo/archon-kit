@@ -1,0 +1,7 @@
+# Skipping at the pause leaves the deploy node out.
+fixture:
+  expect: completed
+  reached: [build_artifact, approve]
+  inputs: { ref: "" }
+build_artifact: "would build abc1234 here, for example: make build"
+approve: { decision: skip, text: "" }

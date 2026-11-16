@@ -1,0 +1,48 @@
+# A run started with --adopt. Planning and the tests stage are skipped, the failed run's
+# blocked.md goes to the repair stage before the implementer runs, the repair is accepted, one
+# build round is ready, and the owner approves. The final pause shows the repaired tests.
+fixture:
+  expect: completed
+  reached: [reuse, build_go, repair_ready, repair_tests, repair_state, implement, gates, report_pick, report, shots, sync_start, sync_land, cleanup]
+  inputs: { design: platform-icons }
+  resolved-text-contains:
+    final_gate: test(s) changed
+sync_base: main
+settings: docs/briefs
+slug_source: given
+intake: platform-icons
+brief_location: docs/briefs/platform-icons
+gates_declared: "feature: npm run lint, npm test"
+lanes_declared: ":(glob)test/**"
+base_gates: green
+handoffs_declared: none declared
+reuse: reused
+plan_decision: reused
+tests_go: skip
+build_go: go
+round: build
+repair_ready: repair
+repair_tests: repaired two assertions
+repair_state: go
+impl_go: run
+implement: { ask: false, question: "", steps: "", handoffs: [] }
+impl_join: ok
+ask_mode: "no"
+plan_rules: none
+ask_check: go
+review_go: go
+review__scope: scoped
+review__review: { clean: true }
+review__verdict: clean
+gates: green
+ready: pause
+report_pick: { findings: "", open_items: [], summary: "Adds the change.", picks: [], extra_json: "" }
+report: "https://reports.example.net/myrepo/platform-icons/review-report\nplatform-icons is built, reviewed and green, and waits for you to land it.\n2 test(s) changed by the repair stage; the report lists them after its summary."
+shots: ""
+final_gate: { decision: approve, text: "" }
+ship_decision: land
+sync_start: clean
+sync_gates: green
+sync_land: landed
+handoff: no hand-offs
+cleanup: landed on main; removed the worktree

@@ -1,0 +1,663 @@
+#!/usr/bin/env bash
+# usage: archon-kit <command> [args]
+#
+# The command line of the Archon kit. It sets up a repository for the kit's workflows, checks an
+# install, runs the report server, switches between Claude and Codex, and writes the instruction
+# blocks that tell an agent where reports are. Run `archon-kit help` for the commands.
+set -uo pipefail
+
+AH=${ARCHON_HOME:-$HOME/.archon}
+
+# The directory of this file with symlinks resolved, so templates are found whether the command
+# runs from a clone (a linked install) or from a copy under $ARCHON_HOME/scripts.
+resolve_path() { python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"; }
+SELF=$(resolve_path "${BASH_SOURCE[0]}")
+SELF_DIR=$(dirname "$SELF")
+if [ -d "$AH/kit/templates" ]; then
+  TEMPLATES=$AH/kit/templates
+else
+  TEMPLATES=$SELF_DIR/../templates
+fi
+
+die() { printf 'archon-kit: %s\n' "$*" >&2; exit 1; }
+usage_error() { printf 'archon-kit: %s\n' "$*" >&2; printf 'run `archon-kit help` for the commands\n' >&2; exit 2; }
+
+# The installed copy of a kit script when there is one, else the copy beside this file.
+script() {
+  if [ -f "$AH/scripts/$1" ]; then printf '%s\n' "$AH/scripts/$1"; else printf '%s\n' "$SELF_DIR/$1"; fi
+}
+
+have() { command -v "$1" > /dev/null 2>&1; }
+
+# ---- help ---------------------------------------------------------------------------------------
+
+cmd_help() {
+  cat <<'EOF'
+usage: archon-kit <command> [args]
+
+  doctor [DIR]                          check the install, and DIR as a repository `build` can start in
+  init-repo [DIR] [--provider P]        add the .archon/ declarations to a repository (P: claude, codex or both)
+  reports serve|up|down|status|url      the report server and report links
+  agent-docs [--repo DIR | --global]    add the report instructions to CLAUDE.md and AGENTS.md (--yes writes)
+  hooks status|install codex            the lane hook for Codex (--yes writes)
+  provider status|use <claude|codex>    which provider every workflow uses by default
+  run <claude|codex> <workflow> [...]   run one workflow on one provider, whatever the default is
+  run-sync RUN [COMMIT...]              bring commits from the base branch into a paused run
+  playground                           rebuild the workflow playground pages (playground/README.md)
+  help                                  this text
+
+See README.md and docs/ in the kit for what each command does.
+EOF
+}
+
+# ---- provider and run ---------------------------------------------------------------------------
+
+# The names on the `Installed providers:` line of `archon doctor`.
+installed_providers() {
+  archon doctor 2> /dev/null | sed -n 's/^[^A-Za-z]*Installed providers: //p' | grep -oE '[a-z][a-z0-9_-]*( \(|,|$)' | sed 's/[ (,]*$//'
+}
+
+cmd_provider() {
+  local sub=${1:-}
+  case "$sub" in
+    status)
+      have archon || die "archon is not installed"
+      archon ai tier list 2>&1
+      printf 'installed providers: %s\n' "$(installed_providers | tr '\n' ' ')"
+      ;;
+    use)
+      local p=${2:-}
+      case "$p" in claude | codex) ;; *) usage_error "usage: archon-kit provider use <claude|codex>" ;; esac
+      have archon || die "archon is not installed"
+      if ! installed_providers | grep -qx "$p"; then
+        die "$p is not an installed provider; run: archon provider add $p"
+      fi
+      archon ai default "$p"
+      ;;
+    *) usage_error "usage: archon-kit provider status | use <claude|codex>" ;;
+  esac
+}
+
+cmd_run() {
+  local p=${1:-} wf=${2:-}
+  case "$p" in claude | codex) ;; *) usage_error "usage: archon-kit run <claude|codex> <workflow> [archon args]" ;; esac
+  [ -n "$wf" ] || usage_error "usage: archon-kit run <claude|codex> <workflow> [archon args]"
+  shift 2
+  local profile=$AH/profiles/$p.yaml
+  [ -f "$profile" ] || profile=$SELF_DIR/../profiles/$p.yaml
+  [ -f "$profile" ] || die "no profile for $p; run the kit's install.sh"
+  exec archon workflow run "$wf" --config "$profile" "$@"
+}
+
+# ---- upserting a marked block in a file ---------------------------------------------------------
+
+# upsert_block FILE TEMPLATE START END YES: replaces the lines of FILE from START to END with the
+# template's block, or appends it. Prints a diff, and writes only when YES is 1.
+upsert_block() {
+  python3 - "$@" <<'PY'
+import difflib, os, sys
+
+path, template, start, end, yes = sys.argv[1:6]
+block = open(template, encoding="utf-8").read().rstrip("\n") + "\n"
+old = open(path, encoding="utf-8").read() if os.path.exists(path) else ""
+lines = old.splitlines(keepends=True)
+s = next((i for i, l in enumerate(lines) if l.strip() == start), None)
+e = next((i for i, l in enumerate(lines) if s is not None and i >= s and l.strip() == end), None)
+if s is not None and e is not None:
+    new = "".join(lines[:s]) + block + "".join(lines[e + 1:])
+else:
+    sep = "" if not old else ("\n" if old.endswith("\n") else "\n\n")
+    if old and not old.endswith("\n\n") and old.endswith("\n"):
+        sep = "\n"
+    new = old + sep + block
+if new == old:
+    print("%s: already up to date" % path)
+    sys.exit(0)
+diff = difflib.unified_diff(old.splitlines(keepends=True), new.splitlines(keepends=True), "a/" + path if old else "/dev/null", "b/" + path)
+sys.stdout.writelines(diff)
+if yes == "1":
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = path + ".archon-kit.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(new)
+    os.replace(tmp, path)
+    print("wrote %s" % path)
+else:
+    print("(not written; pass --yes to write %s)" % path)
+PY
+}
+
+# ---- agent-docs ---------------------------------------------------------------------------------
+
+cmd_agent_docs() {
+  local repo="" global=0 yes=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo) repo=${2:?usage: archon-kit agent-docs [--repo DIR | --global] [--yes]}; shift 2 ;;
+      --global) global=1; shift ;;
+      --yes) yes=1; shift ;;
+      *) usage_error "usage: archon-kit agent-docs [--repo DIR | --global] [--yes]" ;;
+    esac
+  done
+  [ -z "$repo" ] || [ "$global" = 0 ] || usage_error "give --repo or --global, not both"
+  local claude codex
+  if [ "$global" = 1 ]; then
+    claude=$HOME/.claude/CLAUDE.md
+    codex=${CODEX_HOME:-$HOME/.codex}/AGENTS.md
+  else
+    [ -n "$repo" ] || repo=$(git rev-parse --show-toplevel 2> /dev/null || pwd)
+    [ -d "$repo" ] || die "$repo is not a directory"
+    repo=$(cd "$repo" && pwd)
+    claude=$repo/CLAUDE.md
+    codex=$repo/AGENTS.md
+  fi
+  # Both files hold the same block, so one run rewrites both.
+  upsert_block "$claude" "$TEMPLATES/agents/CLAUDE.md" '<!-- archon-kit:reports:start -->' '<!-- archon-kit:reports:end -->' "$yes"
+  upsert_block "$codex" "$TEMPLATES/agents/AGENTS.md" '<!-- archon-kit:reports:start -->' '<!-- archon-kit:reports:end -->' "$yes"
+}
+
+# ---- hooks --------------------------------------------------------------------------------------
+
+codex_config() { printf '%s\n' "${CODEX_HOME:-$HOME/.codex}/config.toml"; }
+
+cmd_hooks() {
+  local sub=${1:-}
+  case "$sub" in
+    status)
+      local cfg
+      cfg=$(codex_config)
+      if [ -f "$cfg" ] && grep -q 'archon-kit:lane-hook:start' "$cfg"; then
+        printf 'codex: the lane hook block is present in %s\n' "$cfg"
+      else
+        printf 'codex: the lane hook block is not in %s (archon-kit hooks install codex adds it)\n' "$cfg"
+      fi
+      if git rev-parse --show-toplevel > /dev/null 2>&1; then
+        if bash "$(script lane.sh)" verify > /dev/null 2>&1; then
+          printf 'this repository: lanes are enforced while a stage runs\n'
+        else
+          printf 'this repository: nothing enforces the lanes while a stage runs (see lane.sh verify)\n'
+        fi
+      fi
+      ;;
+    install)
+      [ "${2:-}" = codex ] || usage_error "usage: archon-kit hooks install codex [--yes]"
+      shift 2
+      local yes=0
+      case "${1:-}" in --yes) yes=1 ;; "") ;; *) usage_error "usage: archon-kit hooks install codex [--yes]" ;; esac
+      mkdir -p "${CODEX_HOME:-$HOME/.codex}"
+      upsert_block "$(codex_config)" "$TEMPLATES/codex/lane-hook.toml" '# archon-kit:lane-hook:start' '# archon-kit:lane-hook:end' "$yes"
+      if [ "$yes" = 1 ]; then
+        printf 'Codex asks you to review a hook before it runs: open an interactive `codex` session and trust it in /hooks.\n'
+      fi
+      ;;
+    *) usage_error "usage: archon-kit hooks status | install codex [--yes]" ;;
+  esac
+}
+
+# ---- reports ------------------------------------------------------------------------------------
+
+LAUNCHD_LABEL=net.archon-kit.reports
+REPORTS_JSON=$AH/reports.json
+BASE_URL_FILE=$AH/report-base-url
+
+port_open() {
+  python3 -c 'import socket,sys
+s = socket.socket()
+s.settimeout(1)
+sys.exit(0 if s.connect_ex(("127.0.0.1", int(sys.argv[1]))) == 0 else 1)' "$1"
+}
+
+rj() { jq -r "$1 // empty" "$REPORTS_JSON" 2> /dev/null; }
+
+# Fills a service template: @PYTHON@ @SCRIPT@ @PORT@ @BIND@ @ROOT@.
+fill_template() {
+  sed -e "s#@PYTHON@#$1#g" -e "s#@SCRIPT@#$2#g" -e "s#@PORT@#$3#g" -e "s#@BIND@#$4#g" -e "s#@ROOT@#$5#g" "$6"
+}
+
+pid_alive() { [ -n "${1:-}" ] && kill -0 "$1" 2> /dev/null; }
+
+# Stops the server that reports.json records, and deletes its service file. It leaves the base URL.
+stop_recorded() {
+  local method pid unit file
+  method=$(rj .method)
+  case "$method" in
+    systemd)
+      unit=$(rj .unit)
+      file=$(rj .unit_file)
+      systemctl --user disable --now "$unit" > /dev/null 2>&1 || true
+      [ -z "$file" ] || rm -f "$file"
+      systemctl --user daemon-reload > /dev/null 2>&1 || true
+      ;;
+    launchd)
+      file=$(rj .unit_file)
+      launchctl unload "$file" > /dev/null 2>&1 || true
+      [ -z "$file" ] || rm -f "$file"
+      ;;
+    nohup)
+      pid=$(rj .pid)
+      # Only a process that is still the report server is killed, not a pid the system reused.
+      if pid_alive "$pid" && ps -p "$pid" -o command= 2> /dev/null | grep -q 'report-serve\.py'; then
+        kill "$pid" 2> /dev/null || true
+      fi
+      rm -f "$AH/reports.pid"
+      ;;
+  esac
+}
+
+# The pid of the server that reports.json records, or empty.
+recorded_pid() {
+  case "$(rj .method)" in
+    systemd) systemctl --user show "$(rj .unit)" -p MainPID --value 2> /dev/null ;;
+    nohup) rj .pid ;;
+    *) ;;
+  esac
+}
+
+cmd_reports() {
+  local sub=${1:-}
+  [ "$#" -eq 0 ] || shift
+  case "$sub" in
+    serve) exec python3 "$(script report-serve.py)" "$@" ;;
+    up) reports_up "$@" ;;
+    down) reports_down ;;
+    status) reports_status ;;
+    url)
+      [ "$#" -eq 1 ] || usage_error "usage: archon-kit reports url <report file>"
+      bash "$(script report.sh)" link "$1"
+      ;;
+    *) usage_error "usage: archon-kit reports serve|up|down|status|url" ;;
+  esac
+}
+
+reports_up() {
+  local port=8082 bind=127.0.0.1 url="" force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --port) port=${2:?usage: archon-kit reports up [--port N] [--bind ADDR] [--url BASE] [--force]}; shift 2 ;;
+      --bind) bind=${2:?}; shift 2 ;;
+      --url) url=${2:?}; shift 2 ;;
+      --force) force=1; shift ;;
+      *) usage_error "usage: archon-kit reports up [--port N] [--bind ADDR] [--url BASE] [--force]" ;;
+    esac
+  done
+  case "$port" in '' | *[!0-9]*) usage_error "--port takes a number" ;; esac
+  have jq || die "jq is required"
+  have curl || die "curl is required"
+  mkdir -p "$AH/designs"
+
+  local recorded=0 previous="" wrote=true
+  if [ -f "$REPORTS_JSON" ]; then
+    recorded=1
+    # Running it again restarts only a server that it started.
+    previous=$(jq -r '.previous_base_url // empty' "$REPORTS_JSON")
+    wrote=$(jq -r '.wrote_base_url // true' "$REPORTS_JSON")
+    stop_recorded
+    sleep 0.3
+  elif [ -f "$BASE_URL_FILE" ]; then
+    if [ "$force" = 0 ]; then
+      die "$BASE_URL_FILE already exists ($(cat "$BASE_URL_FILE")), so a report server may already be set up; pass --force to replace it"
+    fi
+    previous=$(cat "$BASE_URL_FILE")
+  fi
+  if port_open "$port"; then
+    die "port $port is already in use by something else; pick another with --port"
+  fi
+
+  local base=${url:-http://localhost:$port}
+  printf '%s\n' "$base" > "$BASE_URL_FILE"
+  local py script_path root method="" unit_file="" unit="" pid=""
+  py=$(command -v python3)
+  script_path=$(script report-serve.py)
+  root=$AH/designs
+  if have systemctl && systemctl --user show-environment > /dev/null 2>&1; then
+    method=systemd
+    unit=archon-kit-reports.service
+    unit_file=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$unit
+    mkdir -p "$(dirname "$unit_file")"
+    fill_template "$py" "$script_path" "$port" "$bind" "$root" "$TEMPLATES/service/archon-kit-reports.service" > "$unit_file"
+    systemctl --user daemon-reload > /dev/null 2>&1
+    systemctl --user enable --now "$unit" > /dev/null 2>&1 || die "systemctl could not start $unit (unit file: $unit_file)"
+  elif [ "$(uname -s)" = Darwin ] && have launchctl; then
+    method=launchd
+    unit_file="$HOME/Library/LaunchAgents/$LAUNCHD_LABEL.plist"
+    mkdir -p "$(dirname "$unit_file")"
+    fill_template "$py" "$script_path" "$port" "$bind" "$root" "$TEMPLATES/service/net.archon-kit.reports.plist" > "$unit_file"
+    launchctl unload "$unit_file" > /dev/null 2>&1 || true
+    launchctl load -w "$unit_file" || die "launchctl could not load $unit_file"
+  else
+    method='nohup'
+    nohup "$py" "$script_path" --root "$root" --bind "$bind" --port "$port" > "$AH/reports.log" 2>&1 < /dev/null &
+    pid=$!
+    printf '%s\n' "$pid" > "$AH/reports.pid"
+  fi
+  [ "$recorded" = 1 ] || wrote=true
+  jq -n --arg method "$method" --arg unit "$unit" --arg unit_file "$unit_file" --arg pid "$pid" --argjson port "$port" \
+    --arg bind "$bind" --arg url "$base" --arg root "$root" --arg script "$script_path" --arg previous "$previous" --argjson wrote "$wrote" \
+    '{method: $method, unit: $unit, unit_file: $unit_file, pid: $pid, port: $port, bind: $bind, url: $url, root: $root, script: $script,
+      wrote_base_url: $wrote, previous_base_url: $previous}' > "$REPORTS_JSON"
+
+  # The server answers when curl gets a page and the process it started is still alive.
+  local i=0 now_pid
+  while [ "$i" -lt 25 ]; do
+    now_pid=$(recorded_pid)
+    if [ -n "$now_pid" ] && [ "$now_pid" != 0 ] && pid_alive "$now_pid" && curl -fs --connect-timeout 2 --max-time 4 "http://127.0.0.1:$port/" > /dev/null 2>&1; then
+      printf '%s\n' "$base"
+      return 0
+    fi
+    sleep 0.2
+    i=$((i + 1))
+  done
+  stop_recorded
+  restore_base_url
+  rm -f "$REPORTS_JSON"
+  die "the report server did not answer on port $port within 5 seconds; see $AH/reports.log"
+}
+
+# Puts report-base-url back as it was before `up`, or removes it when `up` made it.
+restore_base_url() {
+  [ "$(rj .wrote_base_url)" = true ] || return 0
+  local previous
+  previous=$(rj .previous_base_url)
+  if [ -n "$previous" ]; then printf '%s\n' "$previous" > "$BASE_URL_FILE"; else rm -f "$BASE_URL_FILE"; fi
+}
+
+reports_down() {
+  [ -f "$REPORTS_JSON" ] || die "no report server was started by archon-kit (no $REPORTS_JSON)"
+  stop_recorded
+  restore_base_url
+  rm -f "$REPORTS_JSON"
+  printf 'stopped the report server\n'
+}
+
+reports_status() {
+  local url port running=no answers=no pid
+  if [ -f "$REPORTS_JSON" ]; then
+    url=$(rj .url)
+    port=$(rj .port)
+    pid=$(recorded_pid)
+    if [ -n "$pid" ] && [ "$pid" != 0 ] && pid_alive "$pid"; then running=yes; fi
+    printf 'server: %s (%s%s)\n' "$([ "$running" = yes ] && echo running || echo 'not running')" "$(rj .method)" "${pid:+, pid $pid}"
+    printf 'base url: %s\n' "$url"
+    if curl -fs --connect-timeout 2 --max-time 4 "http://127.0.0.1:$port/" > /dev/null 2>&1; then answers=yes; fi
+    printf 'answers: %s\n' "$answers"
+    [ "$running" = yes ] && [ "$answers" = yes ]
+    return
+  fi
+  if [ -f "$BASE_URL_FILE" ]; then
+    url=$(cat "$BASE_URL_FILE")
+    printf 'server: not started by archon-kit\nbase url: %s\n' "$url"
+    if curl -fs --connect-timeout 2 --max-time 4 "$url/" > /dev/null 2>&1; then
+      printf 'answers: yes\n'
+      return 0
+    fi
+    printf 'answers: no\n'
+    return 1
+  fi
+  printf 'server: none (archon-kit reports up starts one on localhost)\n'
+  return 1
+}
+
+# ---- doctor -------------------------------------------------------------------------------------
+
+DOCTOR_FIX=0
+d_ok() { printf 'ok    %s\n' "$1"; }
+d_fix() { printf 'fix   %s\n' "$1"; DOCTOR_FIX=$((DOCTOR_FIX + 1)); }
+d_warn() { printf 'warn  %s\n' "$1"; }
+
+# version_ge A B succeeds when dotted version A >= B (numeric fields).
+version_ge() {
+  local a=$1 b=$2 i x y
+  for i in 1 2 3; do
+    x=$(printf '%s' "$a" | cut -d. -f"$i"); y=$(printf '%s' "$b" | cut -d. -f"$i")
+    x=${x:-0}; y=${y:-0}
+    [ "$x" -gt "$y" ] && return 0
+    [ "$x" -lt "$y" ] && return 1
+  done
+  return 0
+}
+
+# first_version TEXT prints the first dotted number in TEXT, such as 2.43.0 from "git version 2.43.0", or nothing.
+first_version() { printf '%s\n' "$1" | sed -nE 's/^[^0-9]*([0-9]+(\.[0-9]+)*).*$/\1/p' | head -n 1; }
+
+cmd_doctor() {
+  local dir=${1:-}
+  local v
+
+  if have archon; then
+    v=$(archon --version 2> /dev/null | sed -n 's/^.*v\([0-9][0-9.]*\).*$/\1/p' | head -n 1)
+    if [ -z "$v" ]; then d_warn "archon is installed but its version could not be read"
+    elif ! version_ge "$v" 0.13.2; then d_fix "archon $v is older than 0.13.2 — update it: archon update"
+    elif [ "$v" != 0.13.2 ]; then d_warn "archon $v: the kit is tested against 0.13.2 only"
+    else d_ok "archon $v"
+    fi
+  else
+    d_fix "archon is not installed — see https://github.com/coleam00/Archon"
+  fi
+  if [ "${BASH_VERSINFO[0]}" -gt 3 ] || { [ "${BASH_VERSINFO[0]}" -eq 3 ] && [ "${BASH_VERSINFO[1]}" -ge 2 ]; }; then
+    d_ok "bash ${BASH_VERSION%%[( ]*}"
+  else
+    d_fix "bash ${BASH_VERSION%%[( ]*} is older than 3.2"
+  fi
+  if have git; then
+    v=$(first_version "$(git --version 2> /dev/null)")
+    if version_ge "${v:-0}" 2.31.0; then d_ok "git $v"; else d_fix "git ${v:-?} is older than 2.31 — git rev-parse --path-format needs 2.31 or later"; fi
+  else
+    d_fix "git is not installed"
+  fi
+  if have jq; then
+    v=$(first_version "$(jq --version 2> /dev/null)")
+    if version_ge "${v:-0}" 1.6.0; then d_ok "jq $v"; else d_fix "jq ${v:-?} is older than 1.6 — upgrade jq (brew upgrade jq, apt install jq)"; fi
+  else
+    d_fix "jq is not installed — install jq (brew install jq, apt install jq)"
+  fi
+  if have node; then
+    v=$(node --version 2> /dev/null | sed 's/^v//')
+    if version_ge "${v:-0}" 20.0.0; then d_ok "node $v"; else d_fix "node $v is older than 20 — lane-hook.mjs and the tests need Node 20 or later"; fi
+  else
+    d_fix "node is not installed — lane-hook.mjs needs Node 20 or later"
+  fi
+  if have python3; then
+    v=$(python3 -c 'import sys, sqlite3; print("%d.%d.%d" % sys.version_info[:3])' 2> /dev/null)
+    if [ -z "$v" ]; then
+      d_fix "python3 cannot import sqlite3 — the cleanup scripts read Archon's database with it"
+    elif version_ge "$v" 3.7.0; then
+      d_ok "python3 $v"
+    else
+      d_fix "python3 $v is older than 3.7"
+    fi
+  else
+    d_fix "python3 is not installed"
+  fi
+  if have timeout; then
+    d_ok "timeout"
+  elif have gtimeout; then
+    d_ok "gtimeout, which the kit uses where timeout is missing; the gnubin directory of Homebrew's coreutils on PATH provides timeout, date and readlink under their own names"
+  else
+    d_fix "neither timeout nor gtimeout is installed — macOS: brew install coreutils"
+  fi
+  have flock && d_ok "flock" || d_fix "flock is not installed — macOS: brew install flock"
+  have realpath && d_ok "realpath" || d_fix "realpath is not installed — report links need it; macOS: brew install coreutils and put its gnubin directory first on PATH"
+  if [ "$(readlink -f / 2> /dev/null)" = / ]; then
+    d_ok "readlink -f"
+  else
+    d_fix "readlink has no -f — worktree-land needs it; macOS: brew install coreutils and put its gnubin directory first on PATH"
+  fi
+  have curl && d_ok "curl" || d_warn "curl is not installed — archon-kit reports up and status need it"
+  if date -u -d @0 > /dev/null 2>&1; then
+    d_ok "date -d"
+  elif have gdate; then
+    d_ok "gdate"
+  else
+    d_warn "date has no -d and gdate is not installed — relative check-later times such as '+7 days' fail; macOS: brew install coreutils"
+  fi
+  have fuser && d_ok "fuser" || d_warn "fuser is not installed — git-retry removes no stale git lock"
+  if [ -d "${KIT_PROC_ROOT:-/proc}" ]; then
+    d_ok "process checks read ${KIT_PROC_ROOT:-/proc}"
+  elif have ps && have lsof; then
+    d_ok "process checks use ps and lsof"
+  else
+    d_warn "no /proc, and ps or lsof is missing — workflow-cleanup cannot tell which runs are dead or which worktrees are in use, so it leaves them alone"
+  fi
+  have gh && d_ok "gh" || d_warn "gh is not installed — build needs it when deliver is draft-pr, and without it a branch with an open pull request reads as pushed"
+  local providers=0
+  if have claude; then d_ok "claude on PATH"; providers=$((providers + 1)); else d_warn "claude is not on PATH"; fi
+  if have codex; then d_ok "codex on PATH"; providers=$((providers + 1)); else d_warn "codex is not on PATH"; fi
+  [ "$providers" -gt 0 ] || d_fix "neither claude nor codex is on PATH — workflows need a provider"
+  case ":$PATH:" in
+    *":$HOME/.local/bin:"*) d_ok "\$HOME/.local/bin is on PATH" ;;
+    *) d_warn "\$HOME/.local/bin is not on PATH, so the archon-kit command may not be found" ;;
+  esac
+
+  local missing="" f
+  for f in scripts/start-run.sh scripts/lane.sh scripts/lane-hook.mjs scripts/run-gates.sh scripts/gate-summary.sh scripts/base-gates.sh scripts/report.sh scripts/report/build.mjs scripts/kit-settings.sh \
+    scripts/workflow-cleanup.py scripts/procinfo.py scripts/git-retry scripts/worktree-land workflows/kit/build/build.yaml workflows/kit/research/research.yaml workflows/kit/publish/publish.yaml \
+    workflows/kit/workflow-cleanup/workflow-cleanup.yaml profiles/claude.yaml profiles/codex.yaml; do
+    [ -e "$AH/$f" ] || missing="$missing $f"
+  done
+  if [ -z "$missing" ]; then d_ok "the kit's files are in $AH"; else d_fix "missing from $AH:$missing — run the kit's install.sh"; fi
+  [ -f "$AH/kit.json" ] && d_ok "kit.json" || d_warn "no $AH/kit.json (install.sh writes an empty one)"
+
+  if [ -f "$AH/archon.db" ]; then
+    if out=$(ARCHON_HOME=$AH bash "$(script archon-dead-runs.sh)" schema 2>&1); then d_ok "archon database schema"; else d_fix "$out"; fi
+  else
+    d_warn "no Archon database yet, so its schema was not checked"
+  fi
+  if reports_status > /dev/null 2>&1; then d_ok "report server answers"; else d_warn "no report server answers (archon-kit reports up starts one)"; fi
+
+  if [ -n "$dir" ]; then
+    [ -d "$dir" ] || d_fix "$dir is not a directory"
+    if [ -d "$dir" ]; then
+      if (cd "$dir" && git rev-parse --show-toplevel > /dev/null 2>&1); then
+        local out
+        local set
+        for set in feature tests; do
+          if out=$(cd "$dir" && bash "$(script run-gates.sh)" "$set" --list 2>&1); then
+            # init-repo writes a command that fails on purpose and says to edit the file.
+            if printf '%s' "$out" | grep -q 'edit \.archon/gates\.json'; then
+              d_fix "$dir: the $set gate set still holds the placeholder — edit .archon/gates.json"
+            else
+              d_ok "$dir: the $set gate set"
+            fi
+          else
+            d_fix "$dir: $out — edit .archon/gates.json"
+          fi
+        done
+        if out=$(cd "$dir" && bash "$(script lane.sh)" list 2>&1 > /dev/null); then d_ok "$dir: the tests lane"; else d_fix "$dir: $out — edit .archon/lanes.json"; fi
+        if out=$(cd "$dir" && bash "$(script lane.sh)" verify 2>&1); then d_ok "$dir: lanes are enforced"; else d_fix "$dir: $out"; fi
+      else
+        d_fix "$dir is not a git repository"
+      fi
+    fi
+  fi
+  if [ "$DOCTOR_FIX" -gt 0 ]; then
+    printf '%d problem(s) to fix\n' "$DOCTOR_FIX"
+    return 1
+  fi
+  printf 'all checks passed\n'
+}
+
+# ---- init-repo ----------------------------------------------------------------------------------
+
+# The gates that a package.json suggests: lint, typecheck, build and test scripts, in that order.
+gates_from_package() {
+  local dir=$1 runner="npm run"
+  [ -f "$dir/package.json" ] || return 1
+  [ -f "$dir/pnpm-lock.yaml" ] && runner="pnpm run"
+  [ -f "$dir/yarn.lock" ] && runner="yarn run"
+  { [ -f "$dir/bun.lock" ] || [ -f "$dir/bun.lockb" ]; } && runner="bun run"
+  jq -c --arg runner "$runner" '
+    (.scripts // {}) as $s
+    | ([ "lint", "typecheck", "build", "test" ] | map(select($s[.] != null)) | map($runner + " " + .)) as $feature
+    | (if $s.test != null then [$runner + " test"] else [] end) as $tests
+    | if ($feature | length) == 0 then empty
+      else {feature: {parallel: [], ordered: $feature}, tests: {parallel: [], ordered: (if ($tests | length) == 0 then $feature else $tests end)}} end' "$dir/package.json" 2> /dev/null
+}
+
+cmd_init_repo() {
+  local dir="" provider=claude
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --provider) provider=${2:?usage: archon-kit init-repo [DIR] [--provider claude|codex|both]}; shift 2 ;;
+      -*) usage_error "usage: archon-kit init-repo [DIR] [--provider claude|codex|both]" ;;
+      *) [ -z "$dir" ] || usage_error "usage: archon-kit init-repo [DIR] [--provider claude|codex|both]"; dir=$1; shift ;;
+    esac
+  done
+  case "$provider" in claude | codex | both) ;; *) usage_error "--provider takes claude, codex or both" ;; esac
+  have jq || die "jq is required"
+  dir=${dir:-.}
+  [ -d "$dir" ] || die "$dir is not a directory"
+  local top
+  top=$(cd "$dir" && git rev-parse --show-toplevel 2> /dev/null) || die "$dir is not inside a git repository"
+  mkdir -p "$top/.archon"
+  local f made=""
+  for f in config.yaml build.json lanes.json; do
+    if [ ! -e "$top/.archon/$f" ]; then
+      cp "$TEMPLATES/repo/.archon/$f" "$top/.archon/$f"
+      made="$made .archon/$f"
+    fi
+  done
+  if [ ! -e "$top/.archon/gates.json" ]; then
+    if gates=$(gates_from_package "$top") && [ -n "$gates" ]; then
+      printf '%s\n' "$gates" | jq . > "$top/.archon/gates.json"
+      printf 'gates.json: filled from the scripts of package.json; check that they decide whether a change ships\n'
+    else
+      cp "$TEMPLATES/repo/.archon/gates.json" "$top/.archon/gates.json"
+      printf 'gates.json: holds a placeholder that fails on purpose, so build refuses to run until you list the commands that decide whether a change ships\n'
+    fi
+    made="$made .archon/gates.json"
+  fi
+  if [ "$provider" = claude ] || [ "$provider" = both ]; then
+    local settings=$top/.claude/settings.json hook
+    hook='sh -c '"'"'[ -f "${ARCHON_HOME:-$HOME/.archon}/scripts/lane-hook.mjs" ] && exec node "${ARCHON_HOME:-$HOME/.archon}/scripts/lane-hook.mjs"; exit 0'"'"
+    mkdir -p "$top/.claude"
+    [ -f "$settings" ] || printf '{}\n' > "$settings"
+    if jq -e '[.hooks.PreToolUse[]?.hooks[]?.command // empty | select(contains("lane-hook.mjs"))] | length > 0' "$settings" > /dev/null 2>&1; then
+      printf '.claude/settings.json: the lane hook is already registered\n'
+    else
+      jq --arg cmd "$hook" '.hooks.PreToolUse = ((.hooks.PreToolUse // []) + [{matcher: "Write|Edit|MultiEdit|NotebookEdit|Bash", hooks: [{type: "command", command: $cmd}]}])' "$settings" > "$settings.tmp" \
+        && mv "$settings.tmp" "$settings" || die "could not register the lane hook in $settings"
+      made="$made .claude/settings.json"
+    fi
+  fi
+  if [ "$provider" = codex ] || [ "$provider" = both ]; then
+    printf 'codex: no repository file is written; run `archon-kit hooks install codex` once to register the lane hook for your user\n'
+  fi
+  (cd "$top" && cmd_agent_docs --repo "$top" --yes > /dev/null)
+  printf 'wrote:%s\n' "${made:- nothing new}"
+  printf 'next: commit .archon/ and push it. A run'"'"'s worktree is cut from origin/<branch>, so a declaration that is not pushed is not seen.\n'
+  printf 'then check it: archon-kit doctor %s\n' "$top"
+}
+
+# ---- run-sync -----------------------------------------------------------------------------------
+
+cmd_run_sync() {
+  [ "$#" -ge 1 ] || usage_error "usage: archon-kit run-sync <run-id> [commit...]"
+  exec bash "$(script run-sync.sh)" "$@"
+}
+
+# ---- playground ---------------------------------------------------------------------------------
+
+cmd_playground() {
+  [ "$#" -eq 0 ] || usage_error "playground takes no arguments"
+  local pg=$SELF_DIR/../playground
+  [ -f "$pg/refresh.sh" ] || die "no playground/refresh.sh beside $SELF_DIR; run archon-kit from a linked install of the kit clone"
+  exec bash "$pg/refresh.sh"
+}
+
+# ---- dispatch -----------------------------------------------------------------------------------
+
+cmd=${1:-help}
+[ "$#" -eq 0 ] || shift
+case "$cmd" in
+  help | -h | --help) cmd_help ;;
+  doctor) cmd_doctor "$@" ;;
+  init-repo) cmd_init_repo "$@" ;;
+  reports) cmd_reports "$@" ;;
+  agent-docs) cmd_agent_docs "$@" ;;
+  hooks) cmd_hooks "$@" ;;
+  provider) cmd_provider "$@" ;;
+  run) cmd_run "$@" ;;
+  run-sync) cmd_run_sync "$@" ;;
+  playground) cmd_playground "$@" ;;
+  *) usage_error "unknown command $cmd" ;;
+esac

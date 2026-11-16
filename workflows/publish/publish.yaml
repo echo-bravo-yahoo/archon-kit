@@ -1,0 +1,96 @@
+name: publish
+description: |
+  Run a repository's declared publish command for one target, such as building and deploying a
+  page or a service, and check that the result is live.
+  Use when: the repository declares the target under `publish` in .archon/build.json, and a change
+  that touches its paths has landed or the owner wants it published now.
+  Do not use when: the repository declares no such target, or the change is only a draft pull request.
+
+inputs:
+  target:
+    required: true
+    description: the name of a target in the `publish` array of .archon/build.json
+  ref:
+    required: false
+    default: ""
+    description: the commit to publish; empty means the tip of the repository's base branch
+
+nodes:
+  # Finds the target, puts the tree on `ref` (checks it out in the run's worktree, or for an
+  # `in_main` target confirms the main checkout already contains it and has no uncommitted work
+  # under the target's paths), and records both in publish-target.json. It prints `confirm` when
+  # the target asks for the owner's go-ahead and `go` otherwise, so the later `when:` tests one word.
+  # It leaves out mutates_checkout because it may check out `ref`.
+  - id: resolve
+    bash: |
+      set -uo pipefail
+      kit="${ARCHON_HOME:-$HOME/.archon}/scripts"
+      main=$("$kit/build-settings.sh" --main-worktree) || exit 1
+      targets=$(cd "$main" && "$kit/build-settings.sh" publish) || exit 1
+      target=$(printf '%s' "$targets" | jq -c --arg n "$INPUTS_TARGET" 'if type == "array" then map(select(type == "object" and .name == $n)) | first // empty else empty end')
+      if [ -z "$target" ]; then printf 'no publish target named %s in .archon/build.json\n' "$INPUTS_TARGET" >&2; exit 1; fi
+      ref=${INPUTS_REF:-}
+      if [ -z "$ref" ]; then
+        base=$(cd "$main" && "$kit/build-settings.sh" base) || exit 1
+        ref=$(git -C "$main" rev-parse --verify "$base^{commit}") || exit 1
+      fi
+      ref=$(git rev-parse --verify "$ref^{commit}" 2> /dev/null) || { printf '%s is not a commit\n' "${INPUTS_REF:-the base branch}" >&2; exit 1; }
+      if [ "$(printf '%s' "$target" | jq -r '.in_main // false')" = true ]; then
+        git -C "$main" merge-base --is-ancestor "$ref" HEAD || { printf '%s is not in the main checkout\n' "$ref" >&2; exit 1; }
+        specs=()
+        while IFS= read -r p; do
+          [ -z "$p" ] || specs+=(":(glob)$p")
+        done < <(printf '%s' "$target" | jq -r '(.auto_paths // [])[] | select(type == "string")')
+        if [ "${#specs[@]}" -gt 0 ]; then
+          dirty=$(git -C "$main" status --porcelain -- "${specs[@]}") || exit 1
+          if [ -n "$dirty" ]; then
+            printf 'the main checkout has uncommitted changes under %s\n' "$(printf '%s' "$target" | jq -r '(.auto_paths // []) | join(", ")')" >&2
+            exit 1
+          fi
+        fi
+      else
+        git checkout --detach "$ref" > /dev/null 2>&1 || { printf 'cannot check out %s\n' "$ref" >&2; exit 1; }
+      fi
+      printf '%s' "$target" | jq --arg r "$ref" '. + {ref: $r}' > "$ARTIFACTS_DIR/publish-target.json"
+      if [ "$(printf '%s' "$target" | jq -r '.confirm // false')" = true ]; then printf 'confirm\n'; else printf 'go\n'; fi
+
+  - id: confirm
+    depends_on: [resolve]
+    when: "$resolve.output == 'confirm'"
+    wait:
+      attention: |
+        Publish target $INPUTS.target is about to run its command at ref $INPUTS.ref
+        (the base branch's tip when the ref is empty). The command is in .archon/build.json.
+      form: select
+      options:
+        - { id: publish, label: Publish }
+
+  # Runs the target's command in the main checkout when the target is `in_main`, else in the run's
+  # worktree. The lock exists because two publish runs for one repository write the same tree.
+  - id: run
+    depends_on: [resolve, confirm]
+    trigger_rule: none_failed_min_one_success
+    bash: |
+      set -uo pipefail
+      kit="${ARCHON_HOME:-$HOME/.archon}/scripts"
+      t="$ARTIFACTS_DIR/publish-target.json"
+      command=$(jq -r .command "$t") || exit 1
+      [ -n "$command" ] && [ "$command" != null ] || { printf 'the target declares no command\n' >&2; exit 1; }
+      if [ "$(jq -r '.in_main // false' "$t")" = true ]; then dir=$("$kit/build-settings.sh" --main-worktree) || exit 1; else dir=$PWD; fi
+      repo=$("$kit/build-settings.sh" --repo) || exit 1
+      mkdir -p "${ARCHON_HOME:-$HOME/.archon}/state"
+      cd "$dir" || exit 1
+      flock "${ARCHON_HOME:-$HOME/.archon}/state/publish-$repo.lock" bash -c "$command"
+
+  - id: verify
+    depends_on: [run]
+    bash: |
+      set -uo pipefail
+      kit="${ARCHON_HOME:-$HOME/.archon}/scripts"
+      t="$ARTIFACTS_DIR/publish-target.json"
+      check=$(jq -r '.check // empty' "$t")
+      if [ -z "$check" ]; then printf 'no check declared\n'; exit 0; fi
+      if [ "$(jq -r '.in_main // false' "$t")" = true ]; then dir=$("$kit/build-settings.sh" --main-worktree) || exit 1; else dir=$PWD; fi
+      cd "$dir" || exit 1
+      bash -c "$check"
+    mutates_checkout: false

@@ -1,0 +1,102 @@
+{
+  "flags": {
+    "--out": "write",
+    "--spec": "read",
+    "--picks": "read",
+    "--check": "read"
+  },
+  "scripts": [
+    {
+      "match": "run-gates\\.sh",
+      "unless": "--list",
+      "writes": [
+        "gate-report.md",
+        "gates/"
+      ]
+    },
+    {
+      "match": "mutation-check\\.sh\"?[ \\t]+(\"[^\"]*\"|[^\\s;|&()]+)[ \\t]+(\"[^\"]*\"|[^\\s;|&()]+)",
+      "writes": [
+        "$2",
+        "state",
+        "gates/"
+      ],
+      "reads": [
+        "$1",
+        "coverage-bug.md"
+      ]
+    },
+    {
+      "match": "(?:state\\.sh|\\$st)\"?[ \\t]+set\\b",
+      "writes": [
+        "state"
+      ]
+    },
+    {
+      "match": "(?:state\\.sh|\\$st)\"?[ \\t]+get\\b",
+      "reads": [
+        "state"
+      ]
+    },
+    {
+      "match": "run-log\\.sh\"?[ \\t]+[\\w-]+",
+      "writes": [
+        "run.log"
+      ]
+    },
+    {
+      "match": "lane\\.sh\"?[ \\t]+stage\\b",
+      "writes": [
+        "gitdir:archon-stage"
+      ]
+    },
+    {
+      "match": "lane\\.sh\"?[ \\t]+unstage\\b",
+      "writes": [
+        "gitdir:archon-stage"
+      ],
+      "how": "deletes"
+    },
+    {
+      "match": "report\\.sh\"?[ \\t]+page[ \\t]+plan\\b",
+      "writes": [
+        "run.log"
+      ],
+      "reads": [
+        "plan.md",
+        "plan-notes.md"
+      ]
+    },
+    {
+      "match": "report\\.sh\"?[ \\t]+page[ \\t]+review\\b",
+      "writes": [
+        "run.log"
+      ],
+      "reads": [
+        "gate-report.md",
+        "report.md",
+        "state",
+        "test-repairs.md",
+        "repair-ranges.txt"
+      ]
+    },
+    {
+      "match": "report-page\\.py\"?[ \\t]+(\"[^\"]*\"|[^\\s;|&()]+)[ \\t]+(\"[^\"]*\"|[^\\s;|&()]+)",
+      "reads": [
+        "$1"
+      ],
+      "writes": [
+        "$2"
+      ]
+    }
+  ],
+  "nodes": {
+    "build": {
+      "sync_cycle.sync_resolve": {
+        "reads": [
+          "state"
+        ]
+      }
+    }
+  }
+}

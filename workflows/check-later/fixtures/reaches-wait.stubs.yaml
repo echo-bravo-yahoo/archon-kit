@@ -1,0 +1,9 @@
+# A dry run cannot get past a timed wait: the simulator honours a stub only for
+# an attention wait, so `hold` always pauses whatever this file says. What this
+# proves is that the workflow loads, that `due` validates its input, and that
+# the graph reaches the wait. Everything after `hold` is checked live.
+fixture:
+  expect: paused
+  reached: [due]
+  inputs: { when: "2099-01-01T00:00:00Z", claim: the thing happened }
+due: "2099-01-01T00:00:00Z"

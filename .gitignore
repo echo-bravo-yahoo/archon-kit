@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.DS_Store
+node_modules/
+playground/.cache/
+playground/baseline/
+playground/data/annotations.json
+playground/data/findings.json
+playground/data/findings-*.json
+playground/data/aliases.json
+playground/data/findings-note.txt

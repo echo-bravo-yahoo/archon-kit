@@ -1,0 +1,9 @@
+# archon-kit:lane-hook:start
+[[hooks.PreToolUse]]
+matcher = "Bash|apply_patch|Edit|Write"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "sh -c '[ -f \"${ARCHON_HOME:-$HOME/.archon}/scripts/lane-hook.mjs\" ] && exec node \"${ARCHON_HOME:-$HOME/.archon}/scripts/lane-hook.mjs\"; exit 0'"
+timeout = 30
+# archon-kit:lane-hook:end

@@ -1,0 +1,42 @@
+# An agent that returns nothing usable costs the report its verdict and not the pause: diagnosis
+# prints none, and the report is the facts alone.
+fixture:
+  expect: completed
+  inputs: { run: "00000000-0000-0000-0000-000000000000", dry: "no", spend: "no" }
+  reached: [inspect, state, facts, follow_candidates, diagnose, diagnosis, headline, report_page, notice, answer, decision, act, record, cleanup]
+inspect: attention
+state: attention
+facts: fresh
+follow_candidates: "build — use when the work changes the repository's own files; it cannot change files outside this repository. Inputs to supply: none."
+diagnose:
+  summary: "the stage changed a file outside its lane"
+  slug: operator-away-at-plan-gate
+  happened: "The build stopped at lane_impl because the stage changed a file outside its lane. Nothing outside git changed."
+  expected: unexpected
+  expected_why: "The planner should have kept the stage to its lane."
+  fixed_by: ""
+  defect: repo
+  defect_where: "src/tests/parser_test.cc"
+  rescue: none-needed
+  rescue_how: ""
+  work_value: minor
+  work_why: "The unsaved file is a scratch edit."
+  recommend: research
+  recommend_why: "The cause is not clear."
+  question: "Why did the stage change a file outside its lane?"
+  follow_up: { workflow: build, repo: "", inputs: [], note: "Keep the stage inside its lane." }
+  confidence: high
+  evidence:
+    - { claim: "The stage changed one file", source: "facts.md, Work", confirmed: true }
+diagnosis: none
+headline: "build run 00000000 failed at plan_decision; its work is unsaved (1 changed file), and no rung can rescue it."
+report_page: https://reports.example.net/myrepo/workflow-cleanup-operator-away-at-plan-gate-000000/
+notice: { decision: research, text: "" }
+answer: ""
+wt_state: none
+wt_judge: none
+wt_route: none
+decision: research
+act: "started research, run 11111111"
+record: "recorded answered, handed-off"
+cleanup: "removed the worktree and its branch"

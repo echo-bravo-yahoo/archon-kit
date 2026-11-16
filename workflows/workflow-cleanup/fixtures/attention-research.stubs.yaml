@@ -1,0 +1,43 @@
+# A failure that needs a person pauses with a link to the report, and the answer starts research.
+fixture:
+  expect: completed
+  inputs: { run: "00000000-0000-0000-0000-000000000000", dry: "no", spend: "no" }
+  reached: [inspect, state, facts, follow_candidates, diagnose, diagnosis, headline, report_page, notice, answer, decision, act, record, cleanup]
+  resolved-text-contains:
+    notice: "retry rescues again"
+inspect: attention
+state: attention
+facts: fresh
+follow_candidates: "build — use when the work changes the repository's own files; it cannot change files outside this repository. Inputs to supply: none."
+diagnose:
+  summary: "the stage changed a file outside its lane"
+  slug: stage-wrote-outside-lane
+  happened: "The build stopped at lane_impl because the stage changed a file outside its lane. Nothing outside git changed."
+  expected: unexpected
+  expected_why: "The planner should have kept the stage to its lane."
+  fixed_by: ""
+  defect: repo
+  defect_where: "src/tests/parser_test.cc"
+  rescue: none-needed
+  rescue_how: ""
+  work_value: minor
+  work_why: "The unsaved file is a scratch edit."
+  recommend: follow-up
+  recommend_why: "The defect is in the repository and a build can fix it."
+  question: ""
+  follow_up: { workflow: build, repo: "", inputs: [], note: "Keep the stage inside its lane." }
+  confidence: high
+  evidence:
+    - { claim: "The stage changed one file", source: "facts.md, Work", confirmed: true }
+diagnosis: ok
+headline: "The stage changed a file outside its lane. Recommended: follow-up."
+report_page: https://reports.example.net/myrepo/workflow-cleanup-stage-wrote-outside-lane-000000/
+notice: { decision: research, text: "" }
+answer: ""
+wt_state: none
+wt_judge: none
+wt_route: none
+decision: research
+act: "started research, run 11111111"
+record: "recorded answered, handed-off"
+cleanup: "removed the worktree and its branch"

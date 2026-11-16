@@ -1,0 +1,16 @@
+# A run that finished and saved its work is closed out in silence.
+fixture:
+  expect: completed
+  inputs: { run: "00000000-0000-0000-0000-000000000000", dry: "no", spend: "no" }
+  reached: [inspect, state, facts, follow_candidates, settle, decision, record, cleanup]
+inspect: close
+state: close
+facts: none
+follow_candidates: none
+settle: "removed /w/wt-00000000; branch wt-00000000 removed (was abc1234)"
+wt_state: none
+wt_judge: none
+wt_route: none
+decision: none
+record: "recorded closed"
+cleanup: "removed the worktree and its branch"

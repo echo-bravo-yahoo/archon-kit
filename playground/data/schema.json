@@ -1,0 +1,910 @@
+{
+  "engineVersion": "0.13.2",
+  "typeKeys": [
+    "prompt",
+    "command",
+    "bash",
+    "script",
+    "loop",
+    "loop_group",
+    "approval",
+    "wait",
+    "cancel",
+    "include",
+    "workflow"
+  ],
+  "aiTypes": [
+    "prompt",
+    "command",
+    "loop"
+  ],
+  "types": {
+    "prompt": {
+      "glyph": "AI",
+      "ai": true,
+      "template": {
+        "prompt": "Describe the task for the agent."
+      },
+      "summary": "Inline AI node: the agent runs the prompt text.",
+      "fields": [
+        {
+          "name": "prompt",
+          "type": "string",
+          "required": true,
+          "help": "The agent's instructions. Variables and $node.output references are substituted before the agent starts."
+        }
+      ],
+      "trap": "Use idle_timeout, not timeout: timeout on a prompt node is an error."
+    },
+    "command": {
+      "glyph": "CMD",
+      "ai": true,
+      "template": {
+        "command": "command-name"
+      },
+      "summary": "AI node whose prompt is the file .archon/commands/<name>.md.",
+      "fields": [
+        {
+          "name": "command",
+          "type": "string",
+          "required": true,
+          "help": "The command file name, with no path separators, no '..' and no leading dot."
+        },
+        {
+          "name": "with",
+          "type": "object",
+          "required": false,
+          "help": "Named inputs for the command, each a literal or a { from: '$node.output', if_skipped } binding."
+        }
+      ],
+      "trap": "Use idle_timeout, not timeout: timeout on a command node is an error."
+    },
+    "bash": {
+      "glyph": "sh",
+      "ai": false,
+      "template": {
+        "bash": "echo ok"
+      },
+      "summary": "Runs a shell script. No AI. The output is stdout minus one trailing newline.",
+      "fields": [
+        {
+          "name": "bash",
+          "type": "string",
+          "required": true,
+          "help": "The shell script. Only $WORKFLOW_ID, $ARTIFACTS_DIR, $STATE_DIR, $BASE_BRANCH, $DOCS_DIR and node references are substituted as text; other variables arrive as environment variables, including INPUTS_<NAME>."
+        },
+        {
+          "name": "timeout",
+          "type": "number",
+          "required": false,
+          "help": "Milliseconds before the script is stopped."
+        },
+        {
+          "name": "on_timeout",
+          "type": "enum",
+          "allowed": [
+            "skip"
+          ],
+          "required": false,
+          "help": "With 'skip', a timeout skips the node instead of failing it."
+        }
+      ],
+      "trap": "with: on a bash node is an error. A node reference is single-quote escaped when it is substituted."
+    },
+    "script": {
+      "glyph": "py",
+      "ai": false,
+      "template": {
+        "script": "print('ok')",
+        "runtime": "uv"
+      },
+      "summary": "Runs a script under bun or uv. No AI.",
+      "fields": [
+        {
+          "name": "script",
+          "type": "string",
+          "required": true,
+          "help": "The script source."
+        },
+        {
+          "name": "runtime",
+          "type": "enum",
+          "allowed": [
+            "bun",
+            "uv"
+          ],
+          "required": true,
+          "help": "The interpreter."
+        },
+        {
+          "name": "deps",
+          "type": "list",
+          "required": false,
+          "help": "Packages the runtime installs first."
+        },
+        {
+          "name": "timeout",
+          "type": "number",
+          "required": false,
+          "help": "Milliseconds before the script is stopped."
+        },
+        {
+          "name": "on_timeout",
+          "type": "enum",
+          "allowed": [
+            "skip"
+          ],
+          "required": false,
+          "help": "With 'skip', a timeout skips the node."
+        },
+        {
+          "name": "with",
+          "type": "object",
+          "required": false,
+          "help": "Named inputs, each a JSON value or a { from } binding."
+        }
+      ],
+      "trap": "bun is not installed on this machine, so a bun script cannot run here."
+    },
+    "loop": {
+      "glyph": "↻",
+      "ai": true,
+      "template": {
+        "loop": {
+          "prompt": "Do one more pass.",
+          "max_iterations": 5,
+          "until_bash": "test -f \"$ARTIFACTS_DIR/done\""
+        }
+      },
+      "summary": "One AI node repeated until a check passes.",
+      "fields": [
+        {
+          "name": "loop",
+          "type": "object",
+          "required": true,
+          "help": "{ prompt or command, max_iterations, and one of until, until_bash, until_field; optional fresh_context }."
+        },
+        {
+          "name": "timeout",
+          "type": "number",
+          "required": false,
+          "help": "Milliseconds that bound each until_bash run."
+        }
+      ],
+      "trap": "until_field names a boolean that must be declared and required in the node's output_format."
+    },
+    "loop_group": {
+      "glyph": "⟲",
+      "ai": false,
+      "template": {
+        "loop_group": {
+          "nodes": [],
+          "max_iterations": 5,
+          "until_bash": "test -f \"$ARTIFACTS_DIR/settled\""
+        }
+      },
+      "summary": "A sub-graph repeated until until_bash passes or max_iterations is reached.",
+      "fields": [
+        {
+          "name": "loop_group",
+          "type": "object",
+          "required": true,
+          "help": "{ nodes, max_iterations, until_bash (or until), optional fresh_context }."
+        },
+        {
+          "name": "timeout",
+          "type": "number",
+          "required": false,
+          "help": "Milliseconds that bound each until_bash run."
+        }
+      ],
+      "trap": "A pause in the body must be the body's last node, so the loop sees your answer only in the next round. max_iterations includes the settling round. until_field is an error here."
+    },
+    "approval": {
+      "glyph": "✓?",
+      "ai": false,
+      "template": {
+        "approval": {
+          "message": "Proceed?"
+        }
+      },
+      "summary": "Deprecated pause; a wait node replaces it.",
+      "fields": [
+        {
+          "name": "approval",
+          "type": "object",
+          "required": true,
+          "help": "{ message, decisions or on_reject, capture_response }."
+        }
+      ],
+      "trap": "decisions and on_reject are mutually exclusive."
+    },
+    "wait": {
+      "glyph": "||",
+      "ai": false,
+      "template": {
+        "wait": {
+          "attention": "Question for the owner",
+          "form": "approval"
+        }
+      },
+      "summary": "A pause: stops the run until a person answers or a time passes.",
+      "fields": [
+        {
+          "name": "wait",
+          "type": "object",
+          "required": true,
+          "help": "One of four shapes: { duration_ms }, { until }, { event, deadline_ms } or { attention, form, options, labels }."
+        }
+      ],
+      "trap": "retry, output_format and always_run are errors on a wait node. Two pauses that can run at the same time are an error."
+    },
+    "cancel": {
+      "glyph": "✕",
+      "ai": false,
+      "template": {
+        "cancel": "Reason the run ends."
+      },
+      "summary": "Ends the run, with a reason.",
+      "fields": [
+        {
+          "name": "cancel",
+          "type": "string",
+          "required": true,
+          "help": "The reason shown on the cancelled run."
+        }
+      ],
+      "trap": ""
+    },
+    "include": {
+      "glyph": "<>",
+      "ai": false,
+      "template": {
+        "include": "workflow-name"
+      },
+      "summary": "Inlines another workflow's nodes as <id>__<node>.",
+      "fields": [
+        {
+          "name": "include",
+          "type": "string",
+          "required": true,
+          "help": "The name of the workflow to inline."
+        },
+        {
+          "name": "with",
+          "type": "object",
+          "required": false,
+          "help": "Values for that workflow's inputs."
+        },
+        {
+          "name": "fan_out",
+          "type": "object",
+          "required": false,
+          "help": "{ items, as, max_parallel, join } runs the block once per item."
+        }
+      ],
+      "trap": "mutates_checkout is an error on an include node."
+    },
+    "workflow": {
+      "glyph": "↗",
+      "ai": false,
+      "template": {
+        "workflow": "workflow-name"
+      },
+      "summary": "Launches a child run of another workflow.",
+      "fields": [
+        {
+          "name": "workflow",
+          "type": "string",
+          "required": true,
+          "help": "The name of the workflow to run."
+        },
+        {
+          "name": "input",
+          "type": "string",
+          "required": false,
+          "help": "The child's $ARGUMENTS."
+        },
+        {
+          "name": "with",
+          "type": "object",
+          "required": false,
+          "help": "The child's named inputs. input and with cannot both be set."
+        },
+        {
+          "name": "isolation",
+          "type": "enum",
+          "allowed": [
+            "inherit",
+            "worktree"
+          ],
+          "required": false,
+          "help": "Whether the child gets a worktree of its own."
+        },
+        {
+          "name": "fan_out",
+          "type": "object",
+          "required": false,
+          "help": "{ items, as, max_parallel, join } runs one child per item."
+        }
+      ],
+      "trap": "Not allowed inside a loop body. retry is an error."
+    }
+  },
+  "waitShapes": [
+    {
+      "name": "duration",
+      "keys": [
+        "duration_ms"
+      ],
+      "help": "Wait a fixed time in milliseconds."
+    },
+    {
+      "name": "until",
+      "keys": [
+        "until"
+      ],
+      "help": "Wait until an ISO-8601 time or a $node.output reference."
+    },
+    {
+      "name": "event",
+      "keys": [
+        "event",
+        "deadline_ms"
+      ],
+      "help": "Wait for an event, up to a deadline in milliseconds."
+    },
+    {
+      "name": "attention",
+      "keys": [
+        "attention",
+        "form",
+        "options",
+        "labels"
+      ],
+      "help": "Ask a person. form is message, approval, select or multi_select; select needs options: [{id, label}]."
+    }
+  ],
+  "waitForms": {
+    "message": {
+      "output": "{ text }",
+      "options": []
+    },
+    "approval": {
+      "output": "{ decision: approve|reject, text }",
+      "options": [
+        "approve",
+        "reject"
+      ]
+    },
+    "select": {
+      "output": "{ decision, text }",
+      "options": null
+    },
+    "multi_select": {
+      "output": "{ decisions, text }",
+      "options": null
+    }
+  },
+  "commonFields": [
+    {
+      "name": "id",
+      "group": "graph",
+      "type": "string",
+      "required": true,
+      "help": "Unique in its scope. Lowercase letters, digits and underscores are conventional; INPUTS is reserved.",
+      "trap": ""
+    },
+    {
+      "name": "description",
+      "group": "graph",
+      "type": "string",
+      "help": "Free text for people.",
+      "trap": ""
+    },
+    {
+      "name": "depends_on",
+      "group": "graph",
+      "type": "list",
+      "help": "Ids of the nodes this one waits for.",
+      "trap": "A node referenced in text or in when but missing here passes validation and fails at run time."
+    },
+    {
+      "name": "when",
+      "group": "graph",
+      "type": "string",
+      "help": "A condition; the node is skipped when it is false.",
+      "trap": "No parentheses; && binds tighter than ||."
+    },
+    {
+      "name": "trigger_rule",
+      "group": "graph",
+      "type": "enum",
+      "default": "all_success",
+      "allowed": [
+        "all_success",
+        "one_success",
+        "all_done",
+        "none_failed_min_one_success"
+      ],
+      "help": "How the node reacts to its dependencies' outcomes.",
+      "trap": "none_failed_min_one_success skips the node when no dependency completed."
+    },
+    {
+      "name": "model",
+      "group": "model",
+      "type": "string|list",
+      "help": "A tier (small, medium, large), an @alias, a model name, or a list of two or more.",
+      "trap": ""
+    },
+    {
+      "name": "provider",
+      "group": "model",
+      "type": "string",
+      "help": "The AI provider.",
+      "trap": ""
+    },
+    {
+      "name": "effort",
+      "group": "model",
+      "type": "enum",
+      "allowed": [
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "help": "Reasoning effort.",
+      "trap": ""
+    },
+    {
+      "name": "maxBudgetUsd",
+      "group": "model",
+      "type": "number",
+      "help": "A spend cap for the node in USD; must be positive.",
+      "trap": ""
+    },
+    {
+      "name": "fallbackModel",
+      "group": "model",
+      "type": "string",
+      "help": "The model to use when the first is unavailable.",
+      "trap": ""
+    },
+    {
+      "name": "settingSources",
+      "group": "model",
+      "type": "list",
+      "help": "Which Claude settings layers the agent loads.",
+      "trap": "Archon runs agents with [project], so user hooks and user docs do not reach them."
+    },
+    {
+      "name": "systemPrompt",
+      "group": "model",
+      "type": "string",
+      "help": "A system prompt for the agent.",
+      "trap": ""
+    },
+    {
+      "name": "betas",
+      "group": "model",
+      "type": "list",
+      "help": "Beta feature flags.",
+      "trap": ""
+    },
+    {
+      "name": "allowed_tools",
+      "group": "tools",
+      "type": "list",
+      "help": "Tools the agent may use.",
+      "trap": ""
+    },
+    {
+      "name": "denied_tools",
+      "group": "tools",
+      "type": "list",
+      "help": "Tools the agent may not use.",
+      "trap": ""
+    },
+    {
+      "name": "agents",
+      "group": "tools",
+      "type": "object",
+      "help": "Inline subagents, keyed by kebab-case id.",
+      "trap": "Not yet run on this machine."
+    },
+    {
+      "name": "hooks",
+      "group": "tools",
+      "type": "object",
+      "help": "Hooks for the agent.",
+      "trap": ""
+    },
+    {
+      "name": "mcp",
+      "group": "tools",
+      "type": "string|object",
+      "help": "An MCP server configuration.",
+      "trap": ""
+    },
+    {
+      "name": "skills",
+      "group": "tools",
+      "type": "list",
+      "help": "Skills the agent may use.",
+      "trap": ""
+    },
+    {
+      "name": "plugins",
+      "group": "tools",
+      "type": "list",
+      "help": "Plugins the agent loads.",
+      "trap": ""
+    },
+    {
+      "name": "sandbox",
+      "group": "tools",
+      "type": "object",
+      "help": "A sandbox configuration.",
+      "trap": ""
+    },
+    {
+      "name": "pi",
+      "group": "tools",
+      "type": "object",
+      "help": "Settings for the pi provider.",
+      "trap": ""
+    },
+    {
+      "name": "context",
+      "group": "output",
+      "type": "string|object",
+      "allowed": [
+        "fresh",
+        "shared",
+        "{resume: id}"
+      ],
+      "help": "Whether the node starts a fresh session, shares one, or resumes a node's session.",
+      "trap": "resume works only on prompt and command nodes."
+    },
+    {
+      "name": "output_format",
+      "group": "output",
+      "type": "object",
+      "help": "A JSON schema for the node's output.",
+      "trap": "Comparing the whole output of an AI node to a literal is an error: declare output_format and compare a field."
+    },
+    {
+      "name": "output_type",
+      "group": "output",
+      "type": "string",
+      "help": "A named output type.",
+      "trap": ""
+    },
+    {
+      "name": "persist_session",
+      "group": "output",
+      "type": "boolean",
+      "help": "Keep the agent session after the node.",
+      "trap": ""
+    },
+    {
+      "name": "idle_timeout",
+      "group": "run",
+      "type": "number",
+      "default": 1800000,
+      "help": "Milliseconds without agent activity before the node fails. AI nodes only.",
+      "trap": ""
+    },
+    {
+      "name": "retry",
+      "group": "run",
+      "type": "object",
+      "help": "{ max_attempts 1-5, delay_ms 1000-60000, on_error }. AI nodes retry twice on transient errors by default.",
+      "trap": "Error on a wait, loop_group or workflow node."
+    },
+    {
+      "name": "always_run",
+      "group": "run",
+      "type": "boolean",
+      "help": "Run the node even when the run is failing.",
+      "trap": "Error on a wait node."
+    },
+    {
+      "name": "mutates_checkout",
+      "group": "run",
+      "type": "boolean",
+      "help": "Whether the node changes the checkout.",
+      "trap": "Error on an include node."
+    }
+  ],
+  "graphFields": [
+    "id",
+    "description",
+    "depends_on",
+    "when",
+    "trigger_rule"
+  ],
+  "aiFields": [
+    "model",
+    "provider",
+    "effort",
+    "maxBudgetUsd",
+    "fallbackModel",
+    "settingSources",
+    "systemPrompt",
+    "betas",
+    "allowed_tools",
+    "denied_tools",
+    "agents",
+    "hooks",
+    "mcp",
+    "skills",
+    "plugins",
+    "sandbox",
+    "pi",
+    "context",
+    "persist_session",
+    "idle_timeout"
+  ],
+  "honors": {
+    "prompt": "all",
+    "command": "all",
+    "bash": [
+      "output_format",
+      "retry",
+      "always_run",
+      "mutates_checkout"
+    ],
+    "script": [
+      "output_format",
+      "retry",
+      "always_run",
+      "mutates_checkout"
+    ],
+    "loop": [
+      "model",
+      "provider",
+      "pi",
+      "allowed_tools",
+      "denied_tools",
+      "output_format",
+      "retry",
+      "always_run",
+      "mutates_checkout"
+    ],
+    "loop_group": [
+      "model",
+      "provider",
+      "always_run",
+      "mutates_checkout"
+    ],
+    "wait": [
+      "mutates_checkout"
+    ],
+    "approval": [],
+    "cancel": [],
+    "include": [],
+    "workflow": [
+      "output_format",
+      "output_type"
+    ]
+  },
+  "fieldErrors": {
+    "wait": [
+      "retry",
+      "output_format",
+      "always_run"
+    ],
+    "loop_group": [
+      "retry"
+    ],
+    "include": [
+      "mutates_checkout"
+    ],
+    "workflow": [
+      "retry"
+    ]
+  },
+  "typeFieldSets": {
+    "command": [
+      "command",
+      "with"
+    ],
+    "prompt": [
+      "prompt"
+    ],
+    "bash": [
+      "bash",
+      "timeout",
+      "on_timeout"
+    ],
+    "loop": [
+      "loop",
+      "timeout"
+    ],
+    "loop_group": [
+      "loop_group",
+      "timeout"
+    ],
+    "approval": [
+      "approval"
+    ],
+    "wait": [
+      "wait"
+    ],
+    "cancel": [
+      "cancel"
+    ],
+    "script": [
+      "script",
+      "runtime",
+      "deps",
+      "timeout",
+      "on_timeout",
+      "with"
+    ],
+    "include": [
+      "include",
+      "with",
+      "fan_out"
+    ],
+    "workflow": [
+      "workflow",
+      "input",
+      "isolation",
+      "fan_out",
+      "with"
+    ]
+  },
+  "triggerRules": [
+    {
+      "name": "all_success",
+      "default": true,
+      "help": "Run only if every dependency completed."
+    },
+    {
+      "name": "one_success",
+      "help": "Run if any dependency completed."
+    },
+    {
+      "name": "all_done",
+      "help": "Run once no dependency is pending or running."
+    },
+    {
+      "name": "none_failed_min_one_success",
+      "help": "Run only if no dependency failed and at least one completed. Skipped when no dependency completed."
+    }
+  ],
+  "whenGrammar": {
+    "expression": "clause ('||' clause)*",
+    "clause": "atom ('&&' atom)*",
+    "atom": "LHS op RHS",
+    "lhs": [
+      "$id.output",
+      "$id.output.a.b",
+      "$id.field",
+      "$INPUTS.name",
+      "$LOOP_PREV.id.output[.a.b]"
+    ],
+    "ops": [
+      "==",
+      "!=",
+      "<",
+      ">",
+      "<=",
+      ">="
+    ],
+    "rhs": "a single-quoted string, a number, true or false",
+    "notes": [
+      "&& binds tighter than ||; there are no parentheses.",
+      "== and != compare strings, so == true compares to \"true\".",
+      "The numeric operators need a numeric right-hand side.",
+      "$LOOP_PREV is valid in loop bodies only."
+    ]
+  },
+  "variables": {
+    "run": [
+      "$ARGUMENTS",
+      "$USER_MESSAGE",
+      "$WORKFLOW_ID",
+      "$ARTIFACTS_DIR",
+      "$STATE_DIR",
+      "$BASE_BRANCH",
+      "$DOCS_DIR"
+    ],
+    "shellText": [
+      "$WORKFLOW_ID",
+      "$ARTIFACTS_DIR",
+      "$STATE_DIR",
+      "$BASE_BRANCH",
+      "$DOCS_DIR"
+    ],
+    "refs": [
+      "$INPUTS.<name>",
+      "$<id>.output[.field]",
+      "$LOOP_PREV.<id>.output[.field]"
+    ],
+    "outputCapBytes": 32768
+  },
+  "workflowFields": [
+    {
+      "name": "name",
+      "required": true,
+      "help": "The workflow's name."
+    },
+    {
+      "name": "description",
+      "required": true,
+      "help": "What the workflow is for."
+    },
+    {
+      "name": "nodes",
+      "required": true,
+      "help": "The node list."
+    },
+    {
+      "name": "inputs",
+      "help": "{ name: { required, default, description } }."
+    },
+    {
+      "name": "returns",
+      "help": "The node whose output the run returns."
+    },
+    {
+      "name": "outcome_field",
+      "help": "The output field that decides the run outcome."
+    },
+    {
+      "name": "provider",
+      "help": "Default provider."
+    },
+    {
+      "name": "model",
+      "help": "Default model."
+    },
+    {
+      "name": "effort",
+      "help": "Default effort."
+    },
+    {
+      "name": "sandbox",
+      "help": "Default sandbox."
+    },
+    {
+      "name": "worktree",
+      "help": "{ enabled }."
+    },
+    {
+      "name": "budget",
+      "help": "{ max_work_units, max_spend_usd }."
+    },
+    {
+      "name": "evidence_policy",
+      "help": "{ required }."
+    },
+    {
+      "name": "mutates_checkout",
+      "help": "Default for nodes."
+    },
+    {
+      "name": "persist_sessions",
+      "help": "Keep agent sessions."
+    },
+    {
+      "name": "tags",
+      "help": "Labels."
+    },
+    {
+      "name": "requires",
+      "help": "Platform requirements."
+    },
+    {
+      "name": "deprecated",
+      "help": "{ message }."
+    }
+  ],
+  "unknownKeyNote": "The engine accepts unknown keys at node, nested-object and workflow level and only logs a warning, so a misspelled key name passes validation."
+}

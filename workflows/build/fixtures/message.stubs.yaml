@@ -1,0 +1,61 @@
+# A run started from the web chat or the command line has a message and no design slug.
+# `slug_source` finds that no slug was given, so `name` asks a small model to name the work, and
+# `intake` keeps the message as brief/<slug>/brief.md in the run's artifacts and prints the slug,
+# and `brief_location` prints that directory, so the planner's prompt names the artifacts copy.
+fixture:
+  expect: completed
+  reached: [sync_base, settings, slug_source, name, intake, handoffs_declared, reuse, brief_location, spec, tests, implement, sync_land, cleanup]
+  inputs: {}
+  resolved-text-contains:
+    spec: brief/speech-usable-3f9a1c/
+sync_base: main
+settings: docs/briefs
+slug_source: ask
+name: { slug: speech-usable }
+intake: speech-usable-3f9a1c
+brief_location: /tmp/run/brief/speech-usable-3f9a1c
+gates_declared: "feature: npm run lint, npm test"
+lanes_declared: ":(glob)test/**"
+base_gates: green
+handoffs_declared: none declared
+plan_round: plan
+spec:
+  summary: Adds the timer feature.
+  files: [src/feature.js]
+  needs_decision: false
+  question: ""
+  excuses: []
+  handoffs: []
+  gaps: []
+plan_record: no-ask
+plan_decision: approve
+tests_go: run
+tests: wrote the tests
+red_check: red
+round: build
+impl_go: run
+implement: { ask: false, question: "", steps: "", handoffs: [] }
+impl_join: ok
+ask_mode: "no"
+plan_rules: none
+ask_check: go
+review_go: go
+review__scope: scoped
+review__review: { clean: true }
+review__verdict: clean
+gates: green
+reuse: fresh
+build_go: go
+repair_ready: no-repair
+repair_state: go
+ready: pause
+report_pick: { findings: "", open_items: [], summary: "Adds the change.", picks: [], extra_json: "" }
+report: "https://reports.example.net/myrepo/timer/review-report\ntimer is built, reviewed and green, and waits for you to land it."
+shots: ""
+final_gate: { decision: approve, text: "" }
+ship_decision: land
+sync_start: clean
+sync_gates: green
+sync_land: landed
+handoff: no hand-offs
+cleanup: landed on main; removed the worktree

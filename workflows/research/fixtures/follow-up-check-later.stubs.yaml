@@ -1,0 +1,19 @@
+# The researcher finds a cause fixed and leaves a claim to re-verify, so it proposes
+# `check-later`, which `start-run.sh candidates` offers in any git repository without a
+# declaration. `follow_plan` keeps the proposal, the pause names the workflow with its two
+# inputs, and the owner answers follow-up. The stubs stand in for the check and the launch,
+# so this proves routing and the pause text; start-run.test.mjs covers the script.
+fixture:
+  expect: completed
+  reached: [sync_base, candidates, round, research, follow_plan, report_page, notice, decision, follow_up]
+  resolved-text-contains:
+    notice: "follow-up starts: check-later when=+7 days"
+sync_base: main
+candidates: "build — use when the work changes the repository. Inputs to supply: none.\ncheck-later — use when the work leaves a claim that only a later look can confirm. Inputs to supply: when, claim."
+round: research
+research: { confidence: confirmed, title: "Re-check the retry fix", slug: retry-fix-recheck, follow_ups: [{ workflow: check-later, repo: "", inputs: [{ name: when, value: "+7 days" }, { name: claim, value: "the retry fix still holds on main" }], note: "" }] }
+follow_plan: "check-later when=+7 days claim=the retry fix still holds on main"
+report_page: https://reports.example.net/myrepo/research-retry-fix-recheck-000000/
+notice: { decision: follow-up, text: "go ahead" }
+decision: follow-up
+follow_up: "started check-later, run 00000000"

@@ -1,0 +1,64 @@
+# The planner proposes a hand-off to `deploy-staging`, so the plan gate opens with no question. The plan
+# report names the workflow the run will start, the owner approves, the commits land, and
+# `handoff` starts the approved workflow before `cleanup` removes the worktree. The stubs stand
+# in for `start-run.sh`, so this proves routing and the message; `start-run.test.mjs` proves
+# the script.
+fixture:
+  expect: completed
+  reached: [sync_base, settings, handoffs_declared, plan_report, plan_gate, build_go, tests, red_check, implement, gates, sync_land, handoff, cleanup]
+  inputs: { design: timer }
+  resolved-text-contains:
+    plan_gate: "After delivery this run starts: deploy-staging"
+    final_gate: waits for you to land it
+sync_base: main
+settings: docs/briefs
+slug_source: given
+intake: timer
+brief_location: docs/briefs/timer
+gates_declared: "feature: npm run lint, npm test"
+lanes_declared: ":(glob)test/**"
+base_gates: green
+handoffs_declared: "deploy-staging — use when the change alters anything under src/ that staging runs. Inputs to supply: none."
+plan_round: plan
+spec:
+  summary: Adds the timer feature.
+  files: [src/feature.js]
+  needs_decision: false
+  question: ""
+  excuses: []
+  handoffs: [{ workflow: deploy-staging, inputs: [], note: "deploy-staging the service this change alters" }]
+  gaps: []
+plan_record: ask
+plan_report: "https://reports.example.net/myrepo/timer/plan-report\nAfter delivery this run starts: deploy-staging"
+plan_gate: { decision: approve, text: "" }
+plan_decision: approve
+tests_go: run
+tests: wrote the tests
+red_check: red
+round: build
+impl_go: run
+implement: { ask: false, question: "", steps: "", handoffs: [] }
+impl_join: ok
+ask_mode: "no"
+plan_rules: none
+ask_check: go
+review_go: go
+review__scope: scoped
+review__review: { clean: true }
+review__verdict: clean
+gates: green
+reuse: fresh
+build_go: go
+repair_ready: no-repair
+repair_state: go
+ready: pause
+report_pick: { findings: "", open_items: [], summary: "Adds the change.", picks: [], extra_json: "" }
+report: "https://reports.example.net/myrepo/timer/review-report\ntimer is built, reviewed and green, and waits for you to land it."
+shots: ""
+final_gate: { decision: approve, text: "" }
+ship_decision: land
+sync_start: clean
+sync_gates: green
+sync_land: landed
+handoff: "started deploy-staging, run 0a1b2c"
+cleanup: landed on main; removed the worktree

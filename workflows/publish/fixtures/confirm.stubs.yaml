@@ -1,0 +1,6 @@
+# A target that asks for confirmation pauses before its command runs.
+fixture:
+  expect: paused
+  reached: [resolve]
+  inputs: { target: docs-site }
+resolve: confirm

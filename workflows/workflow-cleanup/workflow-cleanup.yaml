@@ -1,0 +1,487 @@
+name: workflow-cleanup
+description: |
+  Check that finished, failed and cancelled workflow runs completed their task and saved their
+  work, close out the ones that did, rescue the ones that did not, and pause for you on failures
+  that need a person or are likely to recur. With no input it sweeps every run that left a
+  worktree behind or died and starts one independent cleanup run for each. With `run` it cleans
+  up that one run. Every decision comes from recorded facts and git. Two model calls read what
+  those facts cannot judge: the assessment of a worktree with unlanded or uncommitted content, and
+  the diagnosis of a run that needs a person, which tells the owner what happened, whether it
+  should have, whether it needs rescuing and whether its work matters, and recommends an answer.
+  A sweep also goes through the worktrees of the project it runs in, whoever made them. It
+  deletes each worktree with a clean tree whose content is already in main, and starts one
+  cleanup run with `worktree` for each that has unlanded commits or uncommitted changes. That
+  run has an agent read the content, and pauses for you only when the agent finds nothing worth
+  keeping. A worktree that is in use is never touched.
+  Use when: runs have piled up, or one died.
+  Do not use when: a run is still working or paused for you.
+
+inputs:
+  run:
+    default: ""
+    description: "the run id to clean up; empty sweeps the install"
+  dry:
+    default: "no"
+    description: "yes prints what each run would get and changes nothing"
+  spend:
+    default: "no"
+    description: "yes lets this run start model-spending rescues; a sweep grants it to at most three runs"
+  worktree:
+    default: ""
+    description: "the path of one worktree to assess; a sweep starts a run with it for each worktree that needs a look"
+
+# Every `when:` below reads `inspect`, `state`, `decision`, `facts`, `wt_state`, `wt_judge` or
+# `wt_route`, which always run, because a `when:` that reads a skipped node's output fails the
+# run. A pause cannot sit inside a loop, so the rescue loop ends before `notice`.
+nodes:
+  # Prints `sweep` when no run or worktree is named, `worktree` when a worktree is, else the
+  # route: skip, close, rescue, attention or waiting. It also writes verdict.json and state.txt.
+  # Writing `worktree` to state.txt makes `state` print it, so no `when:` of a run's path fires.
+  - id: inspect
+    bash: |
+      set -uo pipefail
+      if [ -n "$INPUTS_RUN" ] && [ -n "$INPUTS_WORKTREE" ]; then echo 'give run or worktree, not both' >&2; exit 1; fi
+      if [ -n "$INPUTS_WORKTREE" ]; then printf 'worktree\n' | tee "$ARTIFACTS_DIR/state.txt"; exit 0; fi
+      if [ -z "$INPUTS_RUN" ]; then printf 'sweep\n'; exit 0; fi
+      python3 -I "${ARCHON_HOME:-$HOME/.archon}/scripts/workflow-cleanup.py" inspect --run "$INPUTS_RUN" --dry "$INPUTS_DRY" \
+        --state "$ARTIFACTS_DIR/state.txt" --out "$ARTIFACTS_DIR/verdict.json"
+    mutates_checkout: false
+
+  - id: candidates
+    depends_on: [inspect]
+    when: "$inspect.output == 'sweep'"
+    bash: python3 -I "${ARCHON_HOME:-$HOME/.archon}/scripts/workflow-cleanup.py" candidates --out "$ARTIFACTS_DIR/candidates.json"
+    mutates_checkout: false
+
+  - id: fan_out
+    depends_on: [candidates]
+    bash: python3 -I "${ARCHON_HOME:-$HOME/.archon}/scripts/workflow-cleanup.py" fan-out --candidates "$ARTIFACTS_DIR/candidates.json" --dry "$INPUTS_DRY"
+    mutates_checkout: false
+
+  # The sweep's second pass, over the worktrees of the project it runs in. It deletes the ones
+  # that hold nothing and starts one run with `worktree` for each that needs an assessment.
+  - id: wt_sweep
+    depends_on: [inspect]
+    when: "$inspect.output == 'sweep'"
+    bash: python3 -I "${ARCHON_HOME:-$HOME/.archon}/scripts/workflow-cleanup.py" worktrees --dry "$INPUTS_DRY"
+    mutates_checkout: false
+
+  # One rung of the rescue ladder for each round: at most three rungs run, and the fourth round
+  # only reads the result. A round ends the loop when state.txt holds a final word.
+  - id: rescue_cycle
+    depends_on: [inspect]
+    when: "$inspect.output == 'rescue'"
+    loop_group:
+      max_iterations: 4
+      fresh_context: true
+      until_bash: 'grep -qxE "close|attention|waiting|skip|dry" "$ARTIFACTS_DIR/state.txt"'
+      nodes:
+        - id: rung
+          bash: |
+            python3 -I "${ARCHON_HOME:-$HOME/.archon}/scripts/workflow-cleanup.py" rescue --run "$INPUTS_RUN" --spend "$INPUTS_SPEND" \
+              --dry "$INPUTS_DRY" --state "$ARTIFACTS_DIR/state.txt" --out "$ARTIFACTS_DIR/verdict.json"
+          mutates_checkout: false
+
+  # sweep | worktree | skip | close | attention | waiting | dry. A sweep wrote no state.txt.
+  - id: state
+    depends_on: [inspect, rescue_cycle]
+    trigger_rule: none_failed_min_one_success
+    bash: cat "$ARTIFACTS_DIR/state.txt" 2> /dev/null || printf 'sweep\n'
+    mutates_checkout: false
+
+  - id: settle
+    depends_on: [state]
+    when: "$state.output == 'close'"
+    bash: python3 -I "${ARCHON_HOME:-$HOME/.archon}/scripts/workflow-cleanup.py" settle --run "$INPUTS_RUN" --dry "$INPUTS_DRY"
+    mutates_checkout: false
+
+  # Gathers what the diagnosing agent reads into facts.json and facts.md, and prints fresh, cached
+  # or none. cached means an earlier pause of this run already diagnosed these exact facts, and
+  # the script has copied that diagnosis to diagnosis.json. It runs in every mode, so the
+  # `when:` of `diagnose` can read it, and prints none unless the run needs a person.
+  - id: facts
+    depends_on: [state]
+    bash: |
+      set -uo pipefail
+      s=$state.output
+      [ "$s" = attention ] || { echo none; exit 0; }
+      python3 -I "${ARCHON_HOME:-$HOME/.archon}/scripts/workflow-cleanup.py" facts --verdict "$ARTIFACTS_DIR/verdict.json" --out "$ARTIFACTS_DIR" || echo none
+    mutates_checkout: false
+
+  # What a report of this run may start, which is what `research` offers: `build` in this
+  # repository and in every other that passes build's start-up checks, and each available global
+  # hand-off (kit.json). It runs in every mode and prints `none` unless the run needs a person, so
+  # the `when:` of `diagnose` can read `facts` without reading a skipped node.
+  - id: follow_candidates
+    depends_on: [state]
+    bash: |
+      set -uo pipefail
+      s=$state.output
+      [ "$s" = attention ] || { echo none; exit 0; }
+      python3 -I "${ARCHON_HOME:-$HOME/.archon}/scripts/workflow-cleanup.py" follow-candidates --run "$INPUTS_RUN" || echo none
+    mutates_checkout: false
+
+  # The workflow's second model call, one for each pause that has no cached diagnosis. The agent
+  # reads facts.md and answers the owner's questions about the run. A wrong diagnosis costs the
+  # owner a misleading report and not a lost run, because the script that renders it holds the
+  # recommended answer to what the defect allows, and nothing here acts on it.
+  - id: diagnose
+    depends_on: [facts, follow_candidates]
+    when: "$facts.output == 'fresh'"
+    model: medium
+    prompt: |
+      Diagnose one finished Archon workflow run for its owner. Read `$ARTIFACTS_DIR/facts.md`: the
+      run's task, a node timeline with each node's output, the effects it may have left outside
+      git, the state of its work, runs that failed the same way and what the owner answered last
+      time, commits made since it started that touch the failing node's files, and the first lines
+      of its artifact files. Read further files named there when the facts are not enough. Use
+      read-only commands only, and no network. Answer the owner's questions: what happened, in
+      terms of the cause and not the symptom; whether it should have happened; whether it needs a
+      rescue and the exact steps; and whether its work matters. Mark an evidence item `confirmed`
+      only when you read the fact in a file or log. Name a commit in `fixed_by` only when it
+      appears in the facts. A file under `~/.archon/workflows/` or `~/.archon/scripts/` that
+      `~/.archon/kit-installed.json` lists belongs to an installed copy of the Archon kit, so a
+      defect there is `global-workflow`. Files in the run's repository are `repo`. An absent
+      operator, an unreachable machine or a quota is `environment` or `operator`. Choose
+      `recommend` by what each answer does. `accept` saves unsaved work,
+      removes the leftover worktree and closes the run out, and leaves any commands in
+      `rescue_how` for the owner to run. `retry` runs the rescue rungs again (commit unsaved
+      work, land an approved build, resume a dead run, relaunch a launch failure, adopt a failed
+      build) and nothing else. `research` starts a research run on `question`. `follow-up`
+      starts one workflow from the list below, which is what the owner may start from a
+      report, with the inputs it asks for: for a `repo` defect, `build` in the run's repository
+      (leave `repo` empty) or in the repository that holds the files; for a `global-workflow`
+      defect, the candidate that changes the files holding the defect, such as `build in <kit
+      clone>` or a global hand-off. Put the workflow in `follow_up.workflow`, the repository
+      name in `follow_up.repo` (empty for the run's own repository), the inputs the list asks
+      for in `follow_up.inputs`, and in `follow_up.note` the files and the change to make. Name
+      only a candidate of the list, because the owner's answer starts exactly that. When the
+      cause is already fixed, recommend `accept` and name the fix in `fixed_by`. Never
+      recommend discarding. Recommend `research` only when you are unsure, and then put the one
+      question it should answer in `question`. Return an empty string for each text field that
+      does not apply, and an empty `follow_up` (empty strings and an empty `inputs`) unless you
+      recommend `follow-up`. Return `slug`, two to five lowercase words joined by hyphens that
+      name the cause, such as 'stale-lock-after-rebase'. It becomes the report's address.
+      Change nothing.
+
+      The candidates:
+      $follow_candidates.output
+    allowed_tools: [Read, Grep, Glob, Bash]
+    mutates_checkout: false
+    output_format:
+      type: object
+      properties:
+        summary: { type: string, description: "the cause in one clause, for a title" }
+        slug: { type: string, description: "two to five lowercase words joined by hyphens that name the cause, such as 'stale-lock-after-rebase'" }
+        happened: { type: string, description: "2 to 4 sentences: the task, the last node that finished, the cause" }
+        expected: { type: string, enum: [expected, unexpected, unclear] }
+        expected_why: { type: string }
+        fixed_by: { type: string, description: "a commit id from the facts that fixed the cause since, or empty" }
+        defect: { type: string, enum: [none, repo, global-workflow, environment, operator, unknown] }
+        defect_where: { type: string, description: "the file or system the defect is in, or empty" }
+        rescue: { type: string, enum: [none-needed, optional, needed] }
+        rescue_how: { type: string, description: "the exact commands when a rescue is needed or optional" }
+        work_value: { type: string, enum: [important, minor, none, unknown] }
+        work_why: { type: string }
+        recommend: { type: string, enum: [accept, retry, research, follow-up] }
+        recommend_why: { type: string, description: "one sentence" }
+        question: { type: string, description: "for research: the one question to answer" }
+        follow_up:
+          type: object
+          description: "for follow-up: the candidate to start; empty strings otherwise"
+          properties:
+            workflow: { type: string }
+            repo: { type: string, description: "the repository the candidate list names, or empty for the run's own" }
+            inputs:
+              type: array
+              items:
+                type: object
+                properties: { name: { type: string }, value: { type: string } }
+                required: [name, value]
+            note: { type: string, description: "the files and the change to make" }
+          required: [workflow, repo, inputs, note]
+        confidence: { type: string, enum: [high, medium, low] }
+        evidence:
+          type: array
+          items:
+            type: object
+            properties:
+              claim: { type: string }
+              source: { type: string }
+              confirmed: { type: boolean }
+            required: [claim, source, confirmed]
+      required: [summary, slug, happened, expected, expected_why, fixed_by, defect, defect_where, rescue, rescue_how, work_value, work_why, recommend, recommend_why, question, follow_up, confidence, evidence]
+
+  # Keeps the agent's diagnosis in diagnosis.json when it parses and names an answer, caches it
+  # against the facts it read, and prints ok, cached or none. It always exits 0, because a failing
+  # `all_done` node fails the run across a usage-limit resume, and a missing diagnosis only costs
+  # the report its verdict.
+  - id: diagnosis
+    depends_on: [facts, diagnose]
+    trigger_rule: all_done
+    when: "$state.output == 'attention'"
+    bash: |
+      set -uo pipefail
+      f="$ARTIFACTS_DIR"
+      a=$diagnose.output
+      w=$facts.output
+      printf '%s' "$a" > "$f/diagnose.json"
+      python3 -I "${ARCHON_HOME:-$HOME/.archon}/scripts/workflow-cleanup.py" diagnosis --run "$INPUTS_RUN" --facts-word "$w" \
+        --raw "$f/diagnose.json" --dir "$f" || echo none
+      exit 0
+    mutates_checkout: false
+
+  - id: headline
+    depends_on: [state, diagnosis]
+    trigger_rule: none_failed_min_one_success
+    when: "$state.output == 'attention'"
+    bash: |
+      python3 -I "${ARCHON_HOME:-$HOME/.archon}/scripts/workflow-cleanup.py" report --verdict "$ARTIFACTS_DIR/verdict.json" \
+        --facts "$ARTIFACTS_DIR/facts.json" --diagnosis "$ARTIFACTS_DIR/diagnosis.json" --out "$ARTIFACTS_DIR/report.md"
+    mutates_checkout: false
+
+  # report.sh markdown builds the page with the repository's report_cmd, as build and research
+  # do, and with report-page.py when the repository has none. A wait node's text does
+  # not resolve $ARTIFACTS_DIR, so the page link is this node's output. The directory is named from
+  # the diagnosis's `slug`, else the cleaned run's workflow name. A diagnosis cached before
+  # `slug` existed has none.
+  - id: report_page
+    depends_on: [headline]
+    bash: |
+      set -uo pipefail
+      run=$(basename "$ARTIFACTS_DIR")
+      repo=$("${ARCHON_HOME:-$HOME/.archon}/scripts/build-settings.sh" --repo) || exit 1
+      slug=$(bash "${ARCHON_HOME:-$HOME/.archon}/scripts/slug.sh" make --run "$run" --prefix workflow-cleanup \
+        --model "$(jq -r '.slug // empty' "$ARTIFACTS_DIR/diagnosis.json" 2> /dev/null)" \
+        --text "$(jq -r '.workflow // empty' "$ARTIFACTS_DIR/verdict.json" 2> /dev/null)" --keep "$ARTIFACTS_DIR/slug.txt") || exit 1
+      bash "${ARCHON_HOME:-$HOME/.archon}/scripts/report.sh" markdown cleanup --report "$ARTIFACTS_DIR/report.md" \
+        --out "${ARCHON_HOME:-$HOME/.archon}/designs/$repo/$slug/index.html" --design "$slug" --run "$run" \
+        --artifacts "$ARTIFACTS_DIR" --status "Workflow cleanup"
+    mutates_checkout: false
+
+  - id: notice
+    depends_on: [report_page, headline]
+    wait:
+      attention: |
+        $report_page.output
+        $headline.output
+        research asks the question above; follow-up starts the workflow the report names, with the report as its brief; retry rescues again with spending allowed; accept saves what is unsaved and closes the run out; discard deletes its unsaved work.
+      form: select
+      options:
+        - { id: research, label: "Find the cause (research)" }
+        - { id: follow-up, label: "Start the recommended follow-up" }
+        - { id: retry, label: "Rescue again, spending allowed" }
+        - { id: accept, label: "Accept it as it is" }
+        - { id: discard, label: "Discard its unsaved work" }
+
+  # An empty answer is accept.
+  - id: answer
+    depends_on: [notice]
+    when: "$state.output == 'attention'"
+    bash: |
+      set -uo pipefail
+      d=$notice.output.decision
+      note=$notice.output.text
+      [ -n "$d" ] || d=accept
+      printf '%s\n' "$d" > "$ARTIFACTS_DIR/decision.txt"
+      printf '%s' "$note" > "$ARTIFACTS_DIR/note.txt"
+    mutates_checkout: false
+
+  # Runs in every mode and prints `none` when no one answered, so `act` can read it.
+  - id: decision
+    depends_on: [state, answer]
+    trigger_rule: none_failed_min_one_success
+    bash: cat "$ARTIFACTS_DIR/decision.txt" 2> /dev/null || printf 'none\n'
+    mutates_checkout: false
+
+  - id: act
+    depends_on: [decision]
+    when: "$decision.output != 'none'"
+    bash: |
+      set -uo pipefail
+      wc="${ARCHON_HOME:-$HOME/.archon}/scripts/workflow-cleanup.py"
+      f="$ARTIFACTS_DIR"
+      d=$decision.output
+      case "$d" in
+        research|follow-up)
+          python3 -I "$wc" handoff --run "$INPUTS_RUN" --workflow "$d" --report "$f/report.md" --note "$f/note.txt" \
+            --diagnosis "$f/diagnosis.json" | tee "$f/handoff.txt" ;;
+        retry)
+          python3 -I "$wc" rescue --run "$INPUTS_RUN" --spend yes --retry --dry "$INPUTS_DRY" --state "$f/state.txt" --out "$f/verdict.json" || exit 1
+          if grep -qx close "$f/state.txt"; then python3 -I "$wc" settle --run "$INPUTS_RUN" --dry "$INPUTS_DRY"; fi ;;
+        accept)
+          python3 -I "$wc" settle --run "$INPUTS_RUN" --dry "$INPUTS_DRY" --save-first ;;
+        discard)
+          python3 -I "$wc" settle --run "$INPUTS_RUN" --dry "$INPUTS_DRY" --discard ;;
+      esac
+    mutates_checkout: false
+
+  - id: record
+    depends_on: [state, settle, act]
+    when: "$state.output != 'sweep'"
+    trigger_rule: none_failed_min_one_success
+    bash: |
+      set -uo pipefail
+      f="$ARTIFACTS_DIR"
+      python3 -I "${ARCHON_HOME:-$HOME/.archon}/scripts/workflow-cleanup.py" record --run "$INPUTS_RUN" --dry "$INPUTS_DRY" \
+        --state "$(cat "$f/state.txt")" --decision "$(cat "$f/decision.txt" 2> /dev/null || printf none)" \
+        --handoff "$f/handoff.txt" --verdict "$f/verdict.json"
+    mutates_checkout: false
+
+  # The worktree mode. `wt_inspect` routes one worktree: skip, delete, abandon (the agent already
+  # said so for this content), assess, or dry. `wt_state` prints `none` in the other modes.
+  - id: wt_inspect
+    depends_on: [inspect]
+    when: "$inspect.output == 'worktree'"
+    bash: |
+      python3 -I "${ARCHON_HOME:-$HOME/.archon}/scripts/workflow-cleanup.py" wt-inspect --worktree "$INPUTS_WORKTREE" --dry "$INPUTS_DRY" \
+        --state "$ARTIFACTS_DIR/wt-state.txt" --facts "$ARTIFACTS_DIR/wt-facts.md" --verdict "$ARTIFACTS_DIR/wt-verdict.json"
+    mutates_checkout: false
+
+  - id: wt_state
+    depends_on: [inspect, wt_inspect]
+    trigger_rule: none_failed_min_one_success
+    bash: cat "$ARTIFACTS_DIR/wt-state.txt" 2> /dev/null || printf 'none\n'
+    mutates_checkout: false
+
+  # The workflow's one model call. A wrong `abandon` costs the owner a prompt and a wrong `keep`
+  # costs nothing, so the prompt leans to `keep`. The facts file holds everything the agent
+  # reads about the worktree; mutates_checkout: false is the guard that it changes nothing.
+  - id: wt_assess
+    depends_on: [wt_state]
+    when: "$wt_state.output == 'assess'"
+    model: medium
+    prompt: |
+      Decide whether one git worktree of this project holds work worth keeping. Read
+      `$ARTIFACTS_DIR/wt-facts.md`: it lists the worktree's unlanded commits, its uncommitted
+      files labelled by how each compares with the base branch, the commits on the base branch
+      that touched the same paths, and the diffs. Return `abandon` only when you are confident
+      that nothing in it is worth keeping: its content is already in the base branch under
+      another form, is superseded by later work there, or is trivial (empty, whitespace,
+      generated, a lockfile, editor or tool settings, exploratory scratch). Return `keep` for
+      anything else and whenever you are unsure, because a wrong `abandon` costs the owner a
+      prompt and a wrong `keep` costs nothing. `reason` is one sentence naming what in the base
+      branch supersedes it, or why it is trivial. `slug` is two to five lowercase words joined by
+      hyphens that name the work in the worktree, such as 'stale-timer-experiment'. It becomes the
+      report's address. Change nothing.
+    allowed_tools: [Read, Grep, Glob, Bash]
+    mutates_checkout: false
+    output_format:
+      type: object
+      properties:
+        verdict: { type: string, enum: [abandon, keep] }
+        reason: { type: string }
+        slug: { type: string, description: "two to five lowercase words joined by hyphens that name the work in the worktree, such as 'stale-timer-experiment'" }
+      required: [verdict, reason, slug]
+
+  # Records the verdict and prints the final state: skip, delete, keep, abandon, dry or none. It
+  # runs in every mode, because the nodes after it read it in every mode.
+  - id: wt_judge
+    depends_on: [wt_state, wt_assess]
+    trigger_rule: none_failed_min_one_success
+    bash: |
+      set -uo pipefail
+      a=$wt_assess.output
+      printf '%s' "$a" > "$ARTIFACTS_DIR/wt-assess.json"
+      python3 -I "${ARCHON_HOME:-$HOME/.archon}/scripts/workflow-cleanup.py" wt-judge --state "$ARTIFACTS_DIR/wt-state.txt" \
+        --assess "$ARTIFACTS_DIR/wt-assess.json" --worktree "$INPUTS_WORKTREE" --verdict "$ARTIFACTS_DIR/wt-verdict.json"
+    mutates_checkout: false
+
+  # A wait node's text does not resolve $ARTIFACTS_DIR, so the page link is this node's output.
+  - id: wt_page
+    depends_on: [wt_judge]
+    when: "$wt_judge.output == 'abandon'"
+    bash: |
+      set -uo pipefail
+      f="$ARTIFACTS_DIR"
+      headline=$(python3 -I "${ARCHON_HOME:-$HOME/.archon}/scripts/workflow-cleanup.py" wt-report --worktree "$INPUTS_WORKTREE" \
+        --facts "$f/wt-facts.md" --verdict "$f/wt-verdict.json" --out "$f/wt-report.md") || exit 1
+      run=$(basename "$f")
+      repo=$("${ARCHON_HOME:-$HOME/.archon}/scripts/build-settings.sh" --repo) || exit 1
+      slug=$(bash "${ARCHON_HOME:-$HOME/.archon}/scripts/slug.sh" make --run "$run" --prefix workflow-cleanup \
+        --model "$(jq -r '.slug // empty' "$f/wt-assess.json" 2> /dev/null)" --text "$(basename "$INPUTS_WORKTREE")" \
+        --keep "$f/slug.txt") || exit 1
+      bash "${ARCHON_HOME:-$HOME/.archon}/scripts/report.sh" markdown cleanup --report "$f/wt-report.md" \
+        --out "${ARCHON_HOME:-$HOME/.archon}/designs/$repo/$slug/index.html" --design "$slug" --run "$run" \
+        --artifacts "$f" --status "Worktree cleanup"
+      printf '%s\n' "$headline"
+    mutates_checkout: false
+
+  # Archon refuses two pauses that could run at once, so this one also waits for `notice`, which
+  # is skipped in the worktree mode. The `when:` keeps it from running after a `notice` that ran.
+  - id: wt_notice
+    depends_on: [wt_page, notice]
+    when: "$wt_judge.output == 'abandon'"
+    trigger_rule: none_failed_min_one_success
+    wait:
+      attention: |
+        $wt_page.output
+        delete saves uncommitted work as a commit, removes the worktree and branch, and prints the branch tip so `git branch <name> <sha>` restores it. keep leaves it and never asks again; it is still deleted if it lands in main.
+      form: select
+      options:
+        - { id: delete, label: "Delete the worktree and branch" }
+        - { id: keep, label: "Keep it, and stop asking" }
+
+  # An empty answer is keep, the safe choice.
+  - id: wt_answer
+    depends_on: [wt_notice]
+    when: "$wt_judge.output == 'abandon'"
+    bash: |
+      set -uo pipefail
+      d=$wt_notice.output.decision
+      [ -n "$d" ] || d=keep
+      printf '%s\n' "$d" > "$ARTIFACTS_DIR/wt-decision.txt"
+    mutates_checkout: false
+
+  # delete, keep or none. A `delete` that wt_inspect routed passes through wt_judge unchanged, so
+  # a worktree that became clean and landed since the sweep is deleted without a prompt. An
+  # `abandon` the agent has judged waits for the owner's answer, and a `keep` verdict prints none
+  # because wt_judge has already recorded it.
+  - id: wt_route
+    depends_on: [wt_judge, wt_answer]
+    trigger_rule: none_failed_min_one_success
+    bash: |
+      set -uo pipefail
+      j=$wt_judge.output
+      if [ -s "$ARTIFACTS_DIR/wt-decision.txt" ]; then cat "$ARTIFACTS_DIR/wt-decision.txt"; elif [ "$j" = delete ]; then echo delete; else echo none; fi
+    mutates_checkout: false
+
+  - id: wt_act
+    depends_on: [wt_route]
+    when: "$wt_route.output != 'none'"
+    bash: |
+      set -uo pipefail
+      d=$wt_route.output
+      python3 -I "${ARCHON_HOME:-$HOME/.archon}/scripts/workflow-cleanup.py" wt-act --worktree "$INPUTS_WORKTREE" --decision "$d" --dry "$INPUTS_DRY"
+    mutates_checkout: false
+
+  # Removes this run's own worktree and branch, which Archon keeps when a run completes. It runs
+  # last because it deletes the directory the run works in. A sweep reaches it through `fan_out`
+  # and `wt_sweep`, a target run through `record`, and a worktree run through `wt_act`, and a
+  # failed chain leaves the worktree for inspection. The
+  # branch is read from the worktree before it goes, because a foreground run's branch
+  # (`archon/task-...`) is not named like its directory. Uncommitted changes keep both. `base` is
+  # read from this worktree's committed build.json and only decides whether the branch can go.
+  - id: cleanup
+    depends_on: [fan_out, record, wt_sweep, wt_act]
+    trigger_rule: none_failed_min_one_success
+    bash: |
+      set -euo pipefail
+      base=$("${ARCHON_HOME:-$HOME/.archon}/scripts/build-settings.sh" base)
+      wt=$(git rev-parse --show-toplevel)
+      branch=$(git branch --show-current)
+      main_wt=$("${ARCHON_HOME:-$HOME/.archon}/scripts/build-settings.sh" --main-worktree)
+      [ -z "$(git status --porcelain)" ] || { printf '%s has uncommitted changes; leaving it\n' "$wt" >&2; exit 1; }
+      cd "$main_wt"
+      git worktree remove --force "$wt"
+      removed=none
+      if [ -n "$branch" ] && git rev-parse --verify -q "refs/heads/$branch" > /dev/null; then
+        if git merge-base --is-ancestor "$branch" "$base"; then
+          git branch -D "$branch" > /dev/null
+          removed=$branch
+        else
+          printf 'branch %s has commits %s lacks; keeping it\n' "$branch" "$base" >&2
+        fi
+      fi
+      printf 'removed %s and branch %s\n' "$wt" "$removed"
+    mutates_checkout: false

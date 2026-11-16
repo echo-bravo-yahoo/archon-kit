@@ -1,0 +1,13 @@
+fixture:
+  expect: completed
+  reached: [sync_base, candidates, round, research, report_page, follow_plan, notice, decision]
+  resolved-text-contains:
+    notice: /research-dark-mode-tokens-000000/
+sync_base: main
+candidates: "build — use when the work changes the repository. Inputs to supply: none."
+round: research
+research: { confidence: confirmed, title: "Act on research findings", slug: dark-mode-tokens, follow_ups: [{ workflow: build, repo: "", inputs: [], note: "" }] }
+follow_plan: build
+report_page: https://reports.example.net/myrepo/research-dark-mode-tokens-000000/
+notice: { decision: close, text: "" }
+decision: close

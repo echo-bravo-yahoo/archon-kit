@@ -1,0 +1,9 @@
+{
+  "handoffs": [
+    {
+      "workflow": "deploy-staging",
+      "pass_ref": true,
+      "use_when": "the change alters anything that is deployed to staging"
+    }
+  ]
+}

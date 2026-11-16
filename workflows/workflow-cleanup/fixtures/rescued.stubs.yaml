@@ -1,0 +1,18 @@
+# A rescue round that ends with the work saved goes on to close the run out. A dry run does one
+# round of the loop, so this proves routing and not that the loop repeats.
+fixture:
+  expect: completed
+  inputs: { run: "00000000-0000-0000-0000-000000000000", dry: "no", spend: "yes" }
+  reached: [inspect, rung, state, facts, follow_candidates, settle, decision, record, cleanup]
+inspect: rescue
+rung: "commit-wip ok saved on branch wt-00000000"
+state: close
+facts: none
+follow_candidates: none
+settle: "removed /w/wt-00000000; branch wt-00000000 kept at abc1234"
+wt_state: none
+wt_judge: none
+wt_route: none
+decision: none
+record: "recorded closed"
+cleanup: "removed the worktree and its branch"

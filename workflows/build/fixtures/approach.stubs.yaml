@@ -1,0 +1,33 @@
+# With approach_check set in kit.json, the first plan round is an approach round: a small node
+# writes an approach, and the plan gate opens on it before any full plan exists. The stub
+# leaves the pause unanswered. The dry run does one round, so it proves the routing and the message,
+# and workflow-nodes.test.mjs proves the words `plan_round` prints.
+fixture:
+  expect: paused
+  reached: [plan_round, approach, plan_record, plan_report]
+  inputs: { design: timer }
+  resolved-text-contains:
+    plan_gate: approve starts the full plan
+sync_base: main
+settings: docs/briefs
+slug_source: given
+intake: timer
+brief_location: docs/briefs/timer
+gates_declared: "feature: npm run lint, npm test"
+lanes_declared: ":(glob)test/**"
+base_gates: green
+handoffs_declared: none declared
+ask_mode: "no"
+plan_rules: none
+reuse: fresh
+plan_round: approach
+approach: |
+  # Approach: timer
+
+  The timer counts down and stops at zero, so a screen can show time left. approve starts the full plan.
+
+  Files: src/feature.js, test/feature.test.js.
+  Tests: the timer counts down and stops at zero.
+  Open: stop at zero or wrap (recommend stop).
+plan_record: ask
+plan_report: "http://localhost:8082/site/timer/approach-report\nThe timer counts down and stops at zero, so a screen can show time left. approve starts the full plan.\napprove starts the full plan from this approach. rework asks for another approach with your note."

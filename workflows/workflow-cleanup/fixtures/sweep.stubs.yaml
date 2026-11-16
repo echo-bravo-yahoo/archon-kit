@@ -1,0 +1,18 @@
+# A run with no input sweeps the install and the project's worktrees. `record` and every node of
+# a single run's or a worktree's path are left out, so reaching one fails the fixture.
+fixture:
+  expect: completed
+  inputs: { run: "", dry: "yes", spend: "no" }
+  reached: [inspect, candidates, fan_out, wt_sweep, state, facts, follow_candidates, decision, cleanup]
+inspect: sweep
+candidates: "RUN       WORKFLOW          KIND               ENDED  WORKTREE  NOTE"
+fan_out: "would start a cleanup run for 00000000 (build, failed): route attention, spend=no"
+wt_sweep: "WORKTREE  ACTION"
+state: sweep
+facts: none
+follow_candidates: none
+wt_state: none
+wt_judge: none
+wt_route: none
+decision: none
+cleanup: "removed the worktree and its branch"

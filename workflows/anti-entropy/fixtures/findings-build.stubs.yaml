@@ -1,0 +1,56 @@
+# start_build's stub stands in for the launch, so this proves routing only.
+# anti-entropy.test.mjs covers the script that renders the brief.
+fixture:
+  expect: completed
+  reached:
+    [
+      sync_base,
+      declared,
+      inventory,
+      pick,
+      claim,
+      evaluate,
+      check_eval,
+      headline,
+      report_page,
+      notice,
+      answer,
+      decision,
+      start_build,
+      record,
+      cleanup,
+    ]
+  inputs: { focus: "" }
+  resolved-text-contains:
+    notice: "build starts with your note"
+sync_base: main
+declared: "feature: npm test"
+inventory: "tests  test/  12 files  never examined"
+pick:
+  { lens: tests, paths: ["test/"], reason: "never examined and the most churn" }
+claim:
+  "Subject: tests of test/ (12 files)\nEarlier runs on overlapping subjects: none"
+evaluate:
+  title: "Merge the overlapping retry tests"
+  slug: retry-test-overlap
+  summary: "Two tests pin the same retry rule."
+  findings:
+    [
+      {
+        id: F1,
+        title: "Merge the two retry tests",
+        files: [test/retry.test.js],
+        change: "Fold both into one table-driven test",
+        keeps: "the retry-once rule stays pinned",
+        risk: low,
+      },
+    ]
+check_eval: findings
+headline: "1 finding(s) in the tests of test/: Merge the two retry tests"
+report_page: https://reports.example.net/myrepo/anti-entropy-tests-retry-test-overlap-000000/
+notice: { decision: build, text: "" }
+answer: ""
+decision: build
+start_build: "started build, run 00000000"
+record: "recorded handed-off"
+cleanup: "removed the worktree and its branch"

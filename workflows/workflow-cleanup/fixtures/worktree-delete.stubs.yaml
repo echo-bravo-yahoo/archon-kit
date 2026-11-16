@@ -1,0 +1,27 @@
+# A worktree with unlanded work that the agent would abandon pauses with a link to the report, and
+# the answer delete removes it. The sweep's nodes and the single run's nodes are left out, so
+# reaching one fails the fixture.
+fixture:
+  expect: completed
+  inputs: { worktree: /w/wt-a, dry: "no", run: "", spend: "no" }
+  reached: [inspect, wt_inspect, wt_state, wt_assess, wt_judge, wt_page, wt_notice, wt_answer, wt_route, wt_act, state, facts, follow_candidates, decision, record, cleanup]
+  resolved-text-contains:
+    wt_notice: "never asks again"
+inspect: worktree
+wt_inspect: assess
+wt_state: assess
+wt_assess: { verdict: abandon, reason: "Everything in it is already in main under other commits.", slug: work-already-in-main }
+wt_judge: abandon
+wt_page: |
+  https://reports.example.net/myrepo/workflow-cleanup-work-already-in-main-000000/
+  Recommended: delete (the assessor found nothing worth keeping). Worktree wt-a (branch wt-a) holds 2 unlanded commits and 0 uncommitted files: Everything in it is already in main under other commits.
+wt_notice: { decision: delete, text: "" }
+wt_answer: ""
+wt_route: delete
+wt_act: "removed /w/wt-a; branch wt-a removed (was abc1234)"
+state: worktree
+facts: none
+follow_candidates: none
+decision: none
+record: "nothing recorded"
+cleanup: "removed the worktree and its branch"

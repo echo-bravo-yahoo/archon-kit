@@ -1,0 +1,44 @@
+name: deploy-staging
+description: |
+  A neutral deploy workflow that the playground's engine check mutates. It has a check, a
+  checkout, a build, a pause, the deploy and a verification.
+  Use when: never; it exists only to be validated.
+inputs:
+  ref:
+    default: main
+    description: the branch to deploy
+nodes:
+  - id: prerequisites
+    bash: |
+      echo ok
+    mutates_checkout: false
+  - id: checkout
+    depends_on: [prerequisites]
+    bash: |
+      echo checkout
+  - id: build
+    depends_on: [checkout]
+    timeout: 900000
+    bash: |
+      echo build
+  - id: ready
+    depends_on: [build]
+    wait:
+      attention: |
+        Ready to deploy.
+      form: select
+      options:
+        - { id: deploy, label: "Deploy" }
+        - { id: skip, label: "Stop here" }
+  - id: deploy
+    depends_on: [ready]
+    when: "$ready.output.decision == 'deploy'"
+    bash: |
+      echo deploy
+    mutates_checkout: false
+  - id: verify
+    depends_on: [deploy]
+    when: "$ready.output.decision == 'deploy'"
+    bash: |
+      echo verify
+    mutates_checkout: false

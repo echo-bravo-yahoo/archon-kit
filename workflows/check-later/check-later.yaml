@@ -1,0 +1,77 @@
+name: check-later
+description: |
+  Wait until a given instant, then check a claim about this repository and
+  raise an attention item only if it does not hold.
+  Use when: something needs re-checking later — that a fix held, that a
+  migration finished, that a deprecation was removed.
+  Do not use when: the check is needed now; just run it.
+
+inputs:
+  when:
+    required: true
+    description: ISO-8601 instant (2026-11-03T09:00:00Z), or a GNU date expression such as 'next monday 09:00'
+  claim:
+    required: true
+    description: what should be true by then, written so it can be checked
+
+nodes:
+  # Validate here rather than passing the input straight to `wait.until`, so a
+  # typo or a past instant fails at launch instead of never waking.
+  - id: due
+    bash: |
+      set -euo pipefail
+      "${ARCHON_HOME:-$HOME/.archon}/scripts/due-instant.sh" "$INPUTS_WHEN"
+    mutates_checkout: false
+
+  - id: hold
+    depends_on: [due]
+    wait:
+      until: "$due.output"
+
+  # mutates_checkout: false is the enforcement, not the prompt: Archon
+  # fingerprints the checkout and fails the node if any tracked path changed.
+  - id: verify
+    depends_on: [hold]
+    model: medium
+    prompt: |
+      Check whether this claim holds in this repository, as of now:
+
+      $INPUTS.claim
+
+      Your worktree was cut when this check was scheduled, so its files are the
+      repository as it stood then, not as it stands now. Start with
+      `git fetch origin`, then read the current state through both `origin/HEAD`
+      and the local base branch (usually `main`, which the worktree shares with
+      the main checkout): `git log`, `git diff HEAD <ref>` and `git show <ref>:<path>`.
+      A change that was landed locally and not pushed is on the local branch only.
+      When one ref contains the other (`git merge-base --is-ancestor`), the newer
+      is the current state; when they have diverged, check the claim against both.
+      Fall back to the worktree's own files only if there is no remote and no
+      local base branch.
+
+      Read the code, the git log and anything else you need. Change nothing: do
+      not check out, reset, merge or rebase, and do not write a file.
+      Return `ok` true only if the claim clearly holds, and `summary` saying
+      what you found — the evidence, not a restatement of the claim.
+    allowed_tools: [Read, Grep, Glob, Bash]
+    mutates_checkout: false
+    output_format:
+      type: object
+      properties:
+        ok: { type: boolean }
+        summary: { type: string }
+      required: [ok, summary]
+
+  - id: tell
+    depends_on: [verify]
+    when: "$verify.output.ok == false"
+    wait:
+      attention: |
+        A scheduled check did not hold.
+
+        Claim: $INPUTS.claim
+
+        $verify.output.summary
+      form: select
+      options:
+        - { id: noted, label: "Noted, close this" }

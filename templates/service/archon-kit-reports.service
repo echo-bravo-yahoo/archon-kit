@@ -1,0 +1,11 @@
+[Unit]
+Description=Read-only HTTP server for the Archon HTML reports
+
+[Service]
+Type=simple
+ExecStart=@PYTHON@ "@SCRIPT@" --root "@ROOT@" --bind @BIND@ --port @PORT@
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

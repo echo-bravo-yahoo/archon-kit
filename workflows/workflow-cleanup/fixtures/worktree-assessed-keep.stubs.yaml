@@ -1,0 +1,18 @@
+# An agent verdict of keep ends the run in silence: wt_judge records it, so there is no report page,
+# no pause and no act node. The pause nodes' stubs are left out, so reaching wt_page fails the fixture.
+fixture:
+  expect: completed
+  inputs: { worktree: /w/wt-a, dry: "no", run: "", spend: "no" }
+  reached: [inspect, wt_inspect, wt_state, wt_assess, wt_judge, wt_route, state, facts, follow_candidates, decision, record, cleanup]
+inspect: worktree
+wt_inspect: assess
+wt_state: assess
+wt_assess: { verdict: keep, reason: "Its commits add a feature main does not have.", slug: unlanded-feature }
+wt_judge: keep
+wt_route: none
+state: worktree
+facts: none
+follow_candidates: none
+decision: none
+record: "nothing recorded"
+cleanup: "removed the worktree and its branch"

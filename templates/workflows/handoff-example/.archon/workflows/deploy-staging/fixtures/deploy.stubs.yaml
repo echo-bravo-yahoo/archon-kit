@@ -1,0 +1,8 @@
+# Approving the pause runs the deploy node.
+fixture:
+  expect: completed
+  reached: [build_artifact, approve, deploy]
+  inputs: { ref: "" }
+build_artifact: "would build abc1234 here, for example: make build"
+approve: { decision: deploy, text: "" }
+deploy: "would deploy to staging here, for example: ./scripts/deploy.sh staging"

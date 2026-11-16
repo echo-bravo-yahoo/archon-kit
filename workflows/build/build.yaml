@@ -1,0 +1,1826 @@
+name: build
+description: |
+  Build a change in the repository the run starts in: plan it, write the failing tests, make
+  them pass, review the result, then pause for the owner. By default the run needs no one after
+  the owner approves: it rebases onto the base branch, has an agent resolve conflicts with builds
+  that landed meanwhile, re-runs the gates and lands the commits on the local base branch. A
+  repository can instead have it push the branch and open a draft pull request and end there
+  (deliver in .archon/build.json, or --input deliver=draft-pr for one run). Builds can run in
+  parallel.
+  The work comes from a design, a brief or a message. A design is design.html with
+  mockups.mjs, and its approved mock-up screens become golden frames. A brief is a brief.md
+  that states the work in a few lines. Both live in <brief_dir>/<slug>/, where brief_dir is
+  set in .archon/build.json (default docs/briefs). A message is the same text given on the
+  command line: the run keeps it in brief/<slug>/brief.md in its artifacts, outside the repository, and
+  plans from it. When the owner has to choose among options they must see, such as drawings,
+  the plan builds a page of them and the plan report includes it.
+  Each stage runs under its own write restriction: the agent that writes the tests is not
+  the agent that makes them pass. When the implementer reports a test it cannot satisfy, a
+  third agent decides whether the test is wrong and repairs it, and the owner sees every
+  repair at the final pause. Nothing is pushed unless the run delivers a draft pull request.
+  The repository can supply, under .archon/: gates.json (the `feature` gate set, which decides
+  whether the change ships, and the `tests` set), lanes.json (the `tests` paths, and optionally
+  `protected` paths no stage may change), build.json (base, deliver, brief_dir, report_cmd,
+  shots_cmd, handoffs) and build-notes/plan.md, tests.md and implement.md (extra instructions
+  for those agents). Each stage that is held to a lane is checked twice: lane.sh compares the
+  working tree at the end of the stage with a snapshot taken at its start and fails the run on a
+  write outside the lane, and lane-hook.mjs refuses such a write as it happens when a hook
+  registration lets it run (.claude/settings.json for Claude, `archon-kit hooks install codex` for
+  Codex). `lanes_declared` fails when neither a hook registration nor "lane_enforcement": "check"
+  in build.json is present.
+  With --input interactive=yes the run needs the owner during the build, not only at its
+  pauses: the implementer may stop and ask a question, as many times as the work needs. It can
+  first start a declared hand-off such as deploy-staging on the commit it made, so the owner has something
+  to try. The run pauses with the question and the steps to take, the owner answers with
+  `archon workflow respond <run-id> reply "what I saw"`, and the next round carries on in the same
+  worktree with the same plan and tests. The review, the gates and the final pause happen only
+  after a round that asks nothing.
+  With "approach_check": true in kit.json, the first plan pause links to a page with an
+  approach, and the full plan is written only after the owner approves it.
+  With "auto_land": true in kit.json, a run that lands and finishes a round green, reviewed clean,
+  with no test repair, no question from the plan and no rework from the owner lands without the
+  final pause.
+  Use when: the owner states the work in a message or a brief, or a design was approved.
+  Use with interactive=yes when: the work cannot finish without the owner trying or choosing
+  something partway, such as a build that has to run in staging before the next step is known.
+  Do not use when: the owner has not said what to build.
+  The planner may excuse a run from the red_check, mutation_cycle or implement stage when the work does not fit
+  it; bash checks each claim against the real diff.
+  The planner may also propose follow-up workflows that build.json declares under `handoffs`,
+  such as deploy-staging. The owner confirms them at the plan gate, and each starts after the change is
+  delivered.
+  A run started from the web chat or with `archon workflow run build "<message>"` gets the
+  worktree Archon cuts from origin/main, and the first node fast-forwards it to the local base
+  branch. `archon workflow run build --adopt <run-id>` continues a failed run's work in its
+  worktree, from that run's plan and tests.
+
+inputs:
+  design:
+    default: ""
+    description: the slug of <brief_dir>/<slug>/, which holds an approved design or a brief.md. Leave it empty when the message states the work, and a model names the work. A slug with no design or brief behind it names the brief the message becomes, and it is also the address of the run's reports, so give a short kebab-case name for the work.
+  deliver:
+    default: ""
+    description: "how the finished change leaves the run: land (rebase onto the base branch and land it on the local branch) or draft-pr (push the branch and open a draft pull request, then end the run). Empty uses deliver in .archon/build.json, and land when that is unset"
+  interactive:
+    default: ""
+    description: "yes lets the implementer stop and ask the owner during the build, repeatedly, after starting a declared hand-off such as deploy-staging on the commit it made. Empty builds without asking"
+
+# Both pauses sit inside a loop_group and settle one round late: a pause must be its loop
+# body's sole terminal sink, and `until_bash` cannot read a pause that a `when:` skipped. The
+# first node of each round reads the previous round's answer through $LOOP_PREV, writes it to a
+# file, and prints `idle` to switch the rest of the round off.
+nodes:
+  # Archon cuts a run's worktree from origin/<base>, which is only as new as the last push.
+  # A landing run's branch moves up to the local base branch here, before `intake` runs. A branch that has commits of its own, as after an adopted run, stays where it is, and
+  # `sync_cycle` rebases it onto the base branch later. A draft-pr run keeps the tree Archon
+  # cut, because its pull request is cut against origin/<base> and any commit that only the
+  # local base branch has would ride along in the diff.
+  #
+  # The base branch and the delivery mode come from the main checkout's .archon/build.json,
+  # because the run's own tree can predate it. The `deliver` input overrides the delivery mode
+  # for one run. This node's whole output is the base branch, which every later node reads as
+  # `$sync_base.output`, so its status lines go to stderr.
+  #
+  # It also records `fork-ref`, the ref that the run's branch left: the local base branch, or
+  # origin/<base> for a draft-pr run and when there is no local base branch. `lane.sh check
+  # --since` lists what the run changed from the commit where HEAD left that ref. A ref names a
+  # branch and not a commit, so it stays right when `sync_cycle` rebases the branch.
+  - id: sync_base
+    bash: |
+      set -uo pipefail
+      settings="${ARCHON_HOME:-$HOME/.archon}/scripts/build-settings.sh"
+      main=$("$settings" --main-worktree) || exit 1
+      base=$(cd "$main" && "$settings" base) || exit 1
+      deliver=$INPUTS_DELIVER
+      [ -n "$deliver" ] || deliver=$(cd "$main" && "$settings" deliver) || exit 1
+      case "$deliver" in
+        land|draft-pr) ;;
+        *) printf 'deliver must be land or draft-pr, not %s\n' "$deliver" >&2; exit 1 ;;
+      esac
+      "${ARCHON_HOME:-$HOME/.archon}/scripts/state.sh" set deliver "$deliver"
+      interactive=$INPUTS_INTERACTIVE
+      case "$interactive" in yes|"") ;; *) printf 'interactive must be yes or empty, not %s\n' "$interactive" >&2; exit 1 ;; esac
+      "${ARCHON_HOME:-$HOME/.archon}/scripts/state.sh" set interactive "$interactive"
+      if [ "$deliver" = draft-pr ]; then
+        printf 'deliver=draft-pr: the branch stays on the tree Archon cut from origin/%s\n' "$base" >&2
+      elif ! git rev-parse --verify -q "refs/heads/$base" > /dev/null; then
+        printf 'no local %s branch, so the base stays\n' "$base" >&2
+      elif git merge-base --is-ancestor "$base" HEAD; then
+        printf 'already contains %s (%s)\n' "$base" "$(git rev-parse --short "$base")" >&2
+      elif git merge-base --is-ancestor HEAD "$base"; then
+        from=$(git rev-parse --short HEAD)
+        "${ARCHON_HOME:-$HOME/.archon}/scripts/git-retry" git merge --ff-only -q "$base" >&2 \
+          || { printf 'could not fast-forward %s to %s\n' "$from" "$base" >&2; exit 1; }
+        printf 'fast-forwarded %s to %s (%s)\n' "$from" "$base" "$(git rev-parse --short HEAD)" >&2
+      else
+        printf 'left at %s: the branch has commits that %s lacks, and sync_cycle rebases it later\n' "$(git rev-parse --short HEAD)" "$base" >&2
+      fi
+      if [ "$deliver" = draft-pr ] || ! git rev-parse --verify -q "refs/heads/$base" > /dev/null; then
+        "${ARCHON_HOME:-$HOME/.archon}/scripts/state.sh" set fork-ref "origin/$base"
+      else
+        "${ARCHON_HOME:-$HOME/.archon}/scripts/state.sh" set fork-ref "$base"
+      fi
+      printf '%s\n' "$base"
+
+  # What the repository says about itself: the directory that holds designs and briefs, from
+  # .archon/build.json. It runs after `sync_base`, because a tree Archon cut from a stale
+  # origin/<base> only has that file once it has moved up to the local base branch. Every
+  # node that needs the directory reads it from this node's output.
+  - id: settings
+    depends_on: [sync_base]
+    bash: '"${ARCHON_HOME:-$HOME/.archon}/scripts/build-settings.sh" brief_dir docs/briefs'
+    mutates_checkout: false
+
+  # A run that has only a message has no slug yet, and `intake` keeps the brief under it in the run's artifacts before any
+  # plan exists, so a small model names the work here. A run with a design slug, or one that adopts an
+  # earlier run, keeps the name it was given, and `name` is skipped.
+  - id: slug_source
+    depends_on: [settings]
+    bash: |
+      set -euo pipefail
+      design=$INPUTS_DESIGN
+      msg=$ARGUMENTS
+      adopted=$(printenv ADOPTED_RUN_DIR || true)
+      if [ -z "$design" ] && [ -n "$msg" ] && [ -z "$adopted" ]; then printf 'ask\n'; else printf 'given\n'; fi
+    mutates_checkout: false
+
+  - id: name
+    depends_on: [slug_source]
+    when: "$slug_source.output == 'ask'"
+    model: small
+    allowed_tools: []
+    mutates_checkout: false
+    prompt: |
+      Name the work this message asks for in two to five lowercase words joined by hyphens. Message: $ARGUMENTS
+    output_format:
+      type: object
+      properties:
+        slug: { type: string }
+      required: [slug]
+
+  # The slug names <brief_dir>/<slug>/ and the report directory under
+  # ~/.archon/designs/<repo>/, and every later node reads it from this node's output. The launcher passes the slug of a
+  # committed design or brief. A run started from the web chat passes a message and, at most, a
+  # slug the router chose, so a slug with no design or brief behind it takes the message as its
+  # brief and keeps it in the run's artifacts, outside the repository. A message with no
+  # slug at all is named by the `name` node, and slug.sh takes the message's own words when `name`
+  # was skipped or returned nothing usable. Only the slug
+  # goes to stdout, because `$intake.output` is the whole of it. What the directory holds goes
+  # to stderr. An adopting run's message arrives empty, so the slug comes from the adopted run's
+  # artifacts, or from its brief commit when it was begun before briefs moved there.
+  #
+  # It records `brief-path`, where a committed brief is or would be, so the lane checks leave it
+  # out of what the run changed (`lane.sh check --exclude`). A message's brief is kept in the
+  # artifacts and no brief is committed, so the path then names nothing and excludes nothing.
+  - id: intake
+    depends_on: [settings, name]
+    trigger_rule: none_failed_min_one_success
+    bash: |
+      set -euo pipefail
+      dir=$settings.output
+      slug=$INPUTS_DESIGN
+      msg=$ARGUMENTS
+      run=$(basename "$ARTIFACTS_DIR")
+      adopted=$(printenv ADOPTED_RUN_DIR || true)
+      if [ -z "$slug" ] && [ -z "$msg" ] && [ -n "$adopted" ]; then
+        from=$(basename "$adopted")
+        brief=
+        for b in "$adopted"/brief/*/brief.md; do
+          [ -f "$b" ] && { brief=$b; break; }
+        done
+        [ -n "$brief" ] || brief=$(git log --grep="Archon build run $from" --diff-filter=A --name-only --format= -- "$dir/*/brief.md" | sed -n 1p)
+        [ -n "$brief" ] || { printf 'adopted run %s left no brief in its artifacts and no brief commit to take the slug from\n' "$from" >&2; exit 1; }
+        slug=$(basename "$(dirname "$brief")")
+      fi
+      if [ -z "$slug" ]; then
+        [ -n "$msg" ] || { printf 'build needs a design slug, or a message that states the work\n' >&2; exit 1; }
+        name_out=$name.output
+        slug=$(bash "${ARCHON_HOME:-$HOME/.archon}/scripts/slug.sh" make --run "$run" \
+          --model "$(printf '%s' "$name_out" | jq -r '.slug // empty' 2> /dev/null || true)" --text "$msg" --fallback build)
+      fi
+      printf '%s' "$slug" | grep -Eq '^[a-z0-9]+(-[a-z0-9]+)*$' \
+        || { printf 'the slug %s must be lowercase letters and digits joined by hyphens\n' "$slug" >&2; exit 1; }
+      d="$dir/$slug"
+      "${ARCHON_HOME:-$HOME/.archon}/scripts/state.sh" set brief-path "$d/brief.md"
+      a="$ARTIFACTS_DIR/brief/$slug"
+      held=no
+      if [ -f "$d/brief.md" ] || { [ -f "$d/design.html" ] && [ -f "$d/mockups.mjs" ]; } || [ -f "$a/brief.md" ]; then held=yes; fi
+      if [ -n "$adopted" ] && [ -f "$adopted/brief/$slug/brief.md" ]; then held=yes; fi
+      if [ "$held" = no ]; then
+        [ -n "$msg" ] || { printf '%s has no approved design and no brief.md, and the run has no message to use as one\n' "$d" >&2; exit 1; }
+        mkdir -p "$a"
+        { printf '# %s\n\n' "$(printf '%s' "$msg" | head -n 1 | cut -c1-70)"; printf '%s\n' "$msg"; } > "$a/brief.md"
+      fi
+      if [ ! -f "$d/brief.md" ] && ! { [ -f "$d/design.html" ] && [ -f "$d/mockups.mjs" ]; }; then
+        if [ -f "$a/brief.md" ]; then d=$a; elif [ -n "$adopted" ] && [ -f "$adopted/brief/$slug/brief.md" ]; then d="$adopted/brief/$slug"; fi
+      fi
+      {
+        if [ -f "$d/design.html" ] && [ -f "$d/mockups.mjs" ]; then
+          printf '%s holds an approved design:\n' "$d"
+          ls "$d"
+          printf '\nScreens:\n'
+          grep -o "id: *\"[a-z0-9-]*\"" "$d/mockups.mjs" | sed 's/id: *//' || true
+        else
+          printf '%s holds a brief:\n' "$d"
+          ls "$d"
+        fi
+      } >&2
+      printf '%s\n' "$slug"
+
+  - id: gates_declared
+    depends_on: [intake]
+    bash: |
+      set -euo pipefail
+      printf 'Gates that decide whether this ships (feature):\n'
+      bash "${ARCHON_HOME:-$HOME/.archon}/scripts/run-gates.sh" feature --list
+      printf '\nGates that must fail once the new tests are written (tests):\n'
+      bash "${ARCHON_HOME:-$HOME/.archon}/scripts/run-gates.sh" tests --list
+    mutates_checkout: false
+
+  # The lanes the stages are held to, and a check that something enforces them while a stage runs
+  # (lane.sh verify). The check at the end of each stage runs whatever the answer.
+  - id: lanes_declared
+    depends_on: [gates_declared]
+    bash: |
+      set -euo pipefail
+      lane="${ARCHON_HOME:-$HOME/.archon}/scripts/lane.sh"
+      bash "$lane" list
+      # The hook has to be registered for the provider that runs the confined stages, and the run's
+      # stored configuration says which that is. With no answer, any registration is enough.
+      args=()
+      for p in $(bash "$lane" providers); do args+=(--provider "$p"); done
+      bash "$lane" verify ${args[@]+"${args[@]}"}
+    mutates_checkout: false
+
+  # The `feature` gates on the commit this run started from, before anything is planned. A gate that
+  # is red there cannot be made green by a round, so the run ends here with the gates' output and
+  # spends no model tokens. The script prints `green`, `cached`, `skipped` or `unknown` and records
+  # it as the `base-gates` key; `unknown` means the check could not run, and the run goes on.
+  # .archon/build.json turns the check off with "base_gates": "off".
+  - id: base_gates
+    depends_on: [lanes_declared]
+    timeout: 3600000
+    bash: |
+      set -uo pipefail
+      bash "${ARCHON_HOME:-$HOME/.archon}/scripts/base-gates.sh"
+    mutates_checkout: false
+
+  # The workflows the planner may propose to start after delivery: the `handoffs` that
+  # .archon/build.json declares. `plan_record` checks the planner's list against the same
+  # declaration, the owner confirms what is left at the plan gate, and `handoff` starts it.
+  - id: handoffs_declared
+    depends_on: [base_gates]
+    bash: |
+      set -uo pipefail
+      out=$("${ARCHON_HOME:-$HOME/.archon}/scripts/start-run.sh" candidates --also build) || exit 1
+      if [ -n "$out" ]; then printf '%s\n' "$out"; else printf 'none declared\n'; fi
+    mutates_checkout: false
+
+  # `yes` when the run was started with interactive=yes and `no` otherwise, so the planner's and
+  # the implementer's prompts can name the word. `sync_base` records the input in `state`.
+  - id: ask_mode
+    depends_on: [handoffs_declared]
+    bash: |
+      if [ "$("${ARCHON_HOME:-$HOME/.archon}/scripts/state.sh" get interactive)" = yes ]; then printf 'yes\n'; else printf 'no\n'; fi
+    mutates_checkout: false
+
+  # The owner's planning rules, from the file kit.json's plan_rules names, or `none`. A run's agents load no
+  # user-level instructions, so the rules reach the planner through its prompt.
+  - id: plan_rules
+    depends_on: [ask_mode]
+    bash: |
+      set -uo pipefail
+      f=$("${ARCHON_HOME:-$HOME/.archon}/scripts/kit-settings.sh" plan_rules) || exit 1
+      [ -n "$f" ] || { printf 'none\n'; exit 0; }
+      case "$f" in "~/"*) f="$HOME/${f#"~/"}" ;; esac
+      [ -f "$f" ] || { printf 'kit.json plan_rules names %s, which is not a file\n' "$f" >&2; exit 1; }
+      cat "$f"
+    mutates_checkout: false
+
+  # A run started with `--adopt <run-id>` skips planning and the tests stage, and starts at the
+  # build loop with the adopted run's plan, tests and notes. Archon puts that run's artifacts
+  # directory in the environment, so `printenv` is the way to read it: naming the variable in
+  # shell text fails a run that adopted nothing. The node records the decision the plan loop
+  # would have, so `plan_decision` reads one key either way. It depends on `plan_rules`, and
+  # through it on `ask_mode`, so that both exist before `plan_cycle` and `build_cycle` start.
+  - id: reuse
+    depends_on: [plan_rules]
+    bash: |
+      set -euo pipefail
+      src=$(printenv ADOPTED_RUN_DIR || true)
+      [ -n "$src" ] || { printf 'fresh\n'; exit 0; }
+      st="${ARCHON_HOME:-$HOME/.archon}/scripts/state.sh"
+      # The adopted run got past its plan gate when its state file holds an approved or reused plan. A
+      # run made before plan-decision was recorded kept the commit its tests stage started from in
+      # tests-sha, or in tests.sha before the state file existed, and wrote it only after the plan was
+      # approved.
+      approved=no
+      case "$(ARTIFACTS_DIR="$src" "$st" get plan-decision)" in approve|reused) approved=yes ;; esac
+      if [ "$approved" = no ] && { [ -n "$(ARTIFACTS_DIR="$src" "$st" get tests-sha)" ] || [ -s "$src/tests.sha" ]; }; then approved=yes; fi
+      [ -f "$src/plan.md" ] && [ "$approved" = yes ] || { printf 'the adopted run has no approved plan to reuse\n' >&2; exit 1; }
+      for f in plan.md plan-notes.md tests-notes.md owner-notes.md blocked.md spec-approved.json handoffs-approved.json mutations.json; do
+        [ ! -f "$src/$f" ] || cp "$src/$f" "$ARTIFACTS_DIR/$f"
+      done
+      if [ -d "$src/brief" ]; then
+        mkdir -p "$ARTIFACTS_DIR/brief"
+        cp -R "$src/brief/." "$ARTIFACTS_DIR/brief/"
+      fi
+      "$st" set plan-decision reused
+      printf 'reused\n'
+    mutates_checkout: false
+
+  # Prints the directory that holds the design or brief: the committed <brief_dir>/<slug> when
+  # one is committed there, else the run's artifacts copy. It runs after `reuse` because an
+  # adopting run's artifacts hold no brief until `reuse` copies the adopted run's.
+  - id: brief_location
+    depends_on: [reuse]
+    bash: |
+      set -euo pipefail
+      dir=$settings.output
+      slug=$intake.output
+      d="$dir/$slug"
+      if [ -f "$d/brief.md" ] || { [ -f "$d/design.html" ] && [ -f "$d/mockups.mjs" ]; }; then
+        printf '%s\n' "$d"
+      elif [ -f "$ARTIFACTS_DIR/brief/$slug/brief.md" ]; then
+        printf '%s\n' "$ARTIFACTS_DIR/brief/$slug"
+      else
+        printf 'no design or brief for %s, in the repository or in the run artifacts\n' "$slug" >&2
+        exit 1
+      fi
+    mutates_checkout: false
+
+  - id: plan_cycle
+    depends_on: [brief_location]
+    when: "$reuse.output == 'fresh'"
+    loop_group:
+      # Up to seven planning rounds, an approach round counting as one, then the settling round.
+      # A choice among drawn options can take several rounds.
+      max_iterations: 8
+      fresh_context: true
+      until_bash: '[ "$("${ARCHON_HOME:-$HOME/.archon}/scripts/state.sh" get plan-loop)" = settled ]'
+      nodes:
+        - id: plan_round
+          bash: |
+            set -uo pipefail
+            st="${ARCHON_HOME:-$HOME/.archon}/scripts/state.sh"
+            prev=$LOOP_PREV.plan_round.output
+            d=$LOOP_PREV.plan_gate.output.decision
+            note=$LOOP_PREV.plan_gate.output.text
+            # Each answer is read once, in the round after its pause, so appending keeps the
+            # owner's earlier picks for the rounds that follow.
+            [ -z "$note" ] || printf '## Owner note\n\n%s\n\n' "$note" >> "$ARTIFACTS_DIR/plan-notes.md"
+            phase=$("$st" get plan-phase)
+            if [ -z "$prev" ]; then
+              if [ "$("${ARCHON_HOME:-$HOME/.archon}/scripts/kit-settings.sh" approach_check false)" = true ]; then phase=approach; else phase=plan; fi
+              "$st" set plan-phase "$phase"; "$st" set plan-loop open; printf '%s\n' "$phase"
+            elif [ "$d" = rework ]; then
+              "$st" set plan-loop open; printf '%s\n' "${phase:-plan}"
+            elif [ "$phase" = approach ]; then
+              "$st" set plan-phase plan; "$st" set plan-loop open; printf 'plan\n'
+            else
+              [ -n "$d" ] || d=approve
+              "$st" set plan-decision "$d"; "$st" set plan-loop settled; printf 'idle\n'
+            fi
+          mutates_checkout: false
+
+        # With approach_check set in kit.json, the first round asks for an approach and pauses
+        # on it, so a wrong direction costs a small node and not a full plan. The owner's answer
+        # starts the full plan from the approved approach, or asks for another approach.
+        - id: approach
+          depends_on: [plan_round]
+          when: "$plan_round.output == 'approach'"
+          model: small
+          allowed_tools: [Read, Grep, Glob, Bash, Write]
+          mutates_checkout: false
+          prompt: |
+            Propose the approach for the change that $brief_location.output/ asks for, so
+            the owner can say whether it is the right direction before a full plan is written. Read
+            everything in that directory, the repository's CLAUDE.md and the code the change touches.
+            Read .archon/build-notes/plan.md if it exists and follow it. When
+            $ARTIFACTS_DIR/plan-notes.md exists, it holds the owner's notes on an earlier approach,
+            oldest first: answer them and keep every choice they made.
+
+            A note in plan-notes.md may be about how an earlier approach read (unclear, too long,
+            missing the reason) and not about the change. Answer such a note by rewriting the opening
+            paragraph and the page, and add no work for it. A note that names a file, behaviour, test
+            or option is about the change and stays binding. When unsure, treat it as about the
+            change and say in the opening paragraph how you read it.
+
+            The owner's steering comes first: the question or brief the run started with,
+            notes in steer.md, plan-notes.md or a `## Note` section, and what the owner said at a
+            pause. Without steering, one run is one conceptual task: work someone would do, review
+            and land as one unit, whatever the number of files, directories or layers. A `## Scope of
+            this run` section decides what the run does and the rest of the brief is context; this
+            holds for a design's design.html as well. A brief with several tasks takes the one the
+            scope section names, else the one the owner's note names, else the most central. The approach
+            says which other tasks it left for separate runs; it never drops one silently and never
+            takes one the scope excludes. A build changes and lands only the repository it runs in.
+
+            Write the approach to $ARTIFACTS_DIR/approach.md. Open approach.md, after its title, with
+            an opening paragraph of two or three sentences in plain words, no Markdown: what the work
+            is in the owner's terms, why it is wanted, and what approve starts. Use the reason the
+            brief gives; when it gives none, say so, and do not invent one. Then the three short
+            lists, in this order: the choices still open, each with the option you recommend and what
+            picking another option changes; the files the change touches; and the tests that will
+            prove it. When the brief leaves no choice open, say so in one line before the lists.
+            Change nothing in the repository.
+
+        - id: spec
+          depends_on: [plan_round]
+          when: "$plan_round.output == 'plan'"
+          model: medium
+          prompt: |
+            Plan the change that $brief_location.output/ asks for. Read everything in
+            that directory first. A design holds design.html (the text), mockups.mjs (every
+            screen) and index.html (the page the owner read). A brief is a brief.md, and it
+            is the whole specification. Then read the repository's CLAUDE.md, if it has one,
+            and the code the change touches. Read .archon/build-notes/plan.md if it exists
+            and follow it.
+
+            The owner's planning rules follow. They bind how you plan and how you write plan.md.
+            When the text is "none", the owner set none.
+            $plan_rules.output
+
+            When $ARTIFACTS_DIR/approach.md exists, the owner approved that approach: follow it, and
+            say in plan.md where you departed from it and why.
+
+            Write the plan to $ARTIFACTS_DIR/plan.md. Two later agents read it and cannot
+            see this conversation or each other. One writes the tests before any
+            implementation exists. The other writes the implementation and may not touch
+            those tests. Write the plan for them: the files each will change, the behaviour
+            stated so a test can assert it, and the cases that must fail before the
+            implementation and pass after it. Where the design leaves a choice open, make it
+            and say what you chose.
+
+            A design was written before other work was built, and the code may have moved.
+            Where its "Prerequisites" section names a platform piece, check whether the code
+            has it now. When it does, use it as it is. When it does not, the plan has to
+            include the smallest version this change needs, and has to say so first. When
+            building that piece would change what something that is already shipped does, or
+            an interface other code reads, set `needs_decision`.
+
+            A plan for a brief covers what the brief asks.
+
+            When the work establishes lasting knowledge, something a later reader of the
+            project could not get from the code and will need, such as a measurement, a
+            limit, a constraint, a decision and its reason, or the result of an experiment,
+            the plan includes recording it. Look at how the project already records
+            knowledge of that kind and put the record in that existing place, updating an
+            existing entry in place when there is one. Say in a "## Recording" section of
+            the plan which place you chose and why. When the project has no such place, put
+            the record in the nearest existing document, or leave recording out and say so
+            there. Do not create a new documentation structure, file layout or convention.
+            Work that establishes nothing new records nothing, and the plan then has no
+            "## Recording" section.
+
+            The owner's steering comes first: the question or brief the run started with,
+            notes in steer.md, plan-notes.md or a `## Note` section, and what the owner said at a
+            pause. Without steering, one run is one conceptual task: work someone would do, review
+            and land as one unit, whatever the number of files, directories or layers. A `## Scope of
+            this run` section decides what the run does and the rest of the brief is context; this
+            holds for a design's design.html as well. A brief with several tasks takes the one the
+            scope section names, else the one the owner's note names, else the most central. plan.md
+            says which other tasks it left for separate runs; it never drops one silently and never
+            takes one the scope excludes. A build changes and lands only the repository it runs in.
+
+            Some stages in this workflow assume the change adds behaviour. When one does not fit
+            this work, you may excuse the run from it by listing its node id in `excuses` with a
+            reason for the owner. An excused stage does not run and nothing replaces it, so say in
+            plan.md, under "## Excused", what the stages that do run must do instead. They read the
+            plan, and it wins over their prompts on that point.
+            - red_check: fails the run when the new tests pass before the implementation exists.
+              Excuse it when the brief only asks for tests that pin behaviour that already works.
+              A mutation check then proves the tests, so the plan must have the test author write
+              mutations.json as `bash "${ARCHON_HOME:-$HOME/.archon}/scripts/mutation-check.sh" --schema`
+              describes. When you expect any new test to fail on the current code, do not excuse
+              it.
+            - implement: the implementer. Excuse it, together with red_check, when no source file
+              changes. A check fails the run if one does.
+            - mutation_cycle: the mutation check that proves tests which already pass. Excuse it,
+              together with red_check, when the brief changes prose only: no test file and no
+              source file changes, and every changed path is in the docs set, which
+              `bash "${ARCHON_HOME:-$HOME/.archon}/scripts/lane.sh" list --set docs` prints. `implement` still runs.
+              Say in "## Excused" that the test author writes nothing and that the implementer
+              edits only those prose files. After each implement round a check fails the run if
+              any other path changed.
+            No other stage can be excused. A check tests each claim against the real diff.
+
+            Tests go under the tests lane and nowhere else, so every case you name has to be
+            expressible as a file there:
+            $lanes_declared.output
+
+            These gates decide whether the change ships:
+            $gates_declared.output
+
+            When the owner has to choose among options they must see, such as drawings,
+            build a page of them at $ARTIFACTS_DIR/plan/index.html and set
+            `needs_decision`. The plan report includes the page's sections, so do not
+            tell the owner to open it.
+
+            When the change alters something that only another workflow can deliver, such as
+            a build that has to be deployed to a device, or leaves a claim that only a later look can
+            confirm, you may propose that workflow in `handoffs`. It
+            starts after this change is delivered, and the owner confirms it at the plan gate, so
+            a proposal opens that gate without `needs_decision`. List only workflows from this
+            list, each only for work its "use when" covers, with the inputs it asks for, and a
+            `note` that says what it should do. Any other entry is dropped. List none when no
+            entry fits.
+            $handoffs_declared.output
+
+            List in `gaps` each thing the change produces that no declared hand-off puts live,
+            such as a built page or a deployed service that nothing publishes. For each gap,
+            propose one `build` hand-off whose `note` asks for the missing target (a workflow that
+            publishes it). A plan whose gaps outnumber its `build` hand-offs fails. List none
+            when the change produces nothing that has to be put live.
+
+            When $ask_mode.output is yes, the owner is available during the build and the
+            implementer may stop to ask them a question. Add a "## Checkpoints" section to plan.md
+            that lists where the implementer is expected to stop, what it asks there and what the
+            owner's answer decides, such as after it makes the experiment that the owner has to try.
+            The implementer may also ask at a point the section did not foresee. Leave the section
+            out when the work needs no one.
+
+            Change nothing inside the repository. Write only under $ARTIFACTS_DIR:
+            plan.md, and the page in $ARTIFACTS_DIR/plan/ when you build one.
+
+            Set `needs_decision` true only when a choice remains whose consequences land
+            outside this change, such as the prerequisite case above, a public interface, a
+            data shape other code reads, or a behaviour change to something shipped; when the
+            owner has to choose among options you drew; or when the design is ambiguous
+            enough that building the wrong reading would waste the whole run. Choosing between two equivalent internal spellings is not one of
+            those: make that call yourself and say what you chose. When it is true, put the
+            choice in `question`: one sentence under 200 characters that can be answered in
+            a sentence. The context for the choice belongs in plan.md, which the owner reads
+            as a page, not in `question`. When it is false, leave `question` empty. True
+            pauses the run for a person.
+
+            When this is a later round, the previous plan is at $ARTIFACTS_DIR/plan.md and
+            its page, if it had one, in $ARTIFACTS_DIR/plan/. What the owner said at the plan
+            gate, oldest note first, is in $ARTIFACTS_DIR/plan-notes.md. A choice the owner
+            made in an earlier note still holds. Answer the notes rather than restating the
+            plan.
+
+            Return `summary` and `files`. `summary` opens the plan page and the owner decides from
+            it, so write at most seven plain sentences, no Markdown headings, in two paragraphs. The
+            first paragraph is two sentences of under 350 characters in all: what the work is in the
+            owner's terms, then why it is wanted (the reason the brief gives, or say that it gives
+            none). The pause message prints only that paragraph, so both have to be in it. The second
+            paragraph gives the work item by item; what approve starts, which is this build and then
+            each hand-off you proposed, by name; and, when `needs_decision` is true, the decision you
+            ask. When the brief asks you to pick or propose work, put the items in the second
+            paragraph, each with its reason. `files` is the repository paths the change will touch.
+            Neither is the plan itself: that stays in plan.md.
+          allowed_tools: [Read, Grep, Glob, Bash, Write]
+          mutates_checkout: false
+          output_format:
+            type: object
+            properties:
+              summary: { type: string }
+              files: { type: array, items: { type: string } }
+              needs_decision: { type: boolean }
+              question: { type: string }
+              excuses:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    node: { type: string, enum: [red_check, mutation_cycle, implement] }
+                    reason: { type: string }
+                  required: [node, reason]
+              handoffs:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    workflow: { type: string }
+                    inputs:
+                      type: array
+                      items:
+                        type: object
+                        properties: { name: { type: string }, value: { type: string } }
+                        required: [name, value]
+                    note: { type: string }
+                  required: [workflow, inputs, note]
+              gaps:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    thing: { type: string }
+                    why: { type: string }
+                  required: [thing, why]
+            required: [summary, files, needs_decision, question, excuses, handoffs, gaps]
+
+        # Records the approved plan's excuses and hand-offs where later nodes can read them, and
+        # prints `ask` when the round ends at the plan gate: the planner set `needs_decision`, or
+        # proposed a hand-off the repository declares, or the round is an approach round, which always
+        # asks. The settling round skips `spec`, which
+        # leaves its output empty and the files as they were. `start-run.sh check` drops a
+        # proposed hand-off the repository does not declare, with a line on stderr. A dropped
+        # hand-off (a `start-run` line on the check's stderr), or a plan with more gaps than `build` hand-offs, is a defect: the node writes
+        # plan-defects.txt, prints it to stderr and exits 1, so the run fails here. `plan_report`
+        # is skipped then, because it follows this node and a failed node leaves no `ask`.
+        # `plan_report` depends on this node, because the pause must be the loop body's sole sink.
+        - id: plan_record
+          depends_on: [plan_round, spec, approach]
+          trigger_rule: all_done
+          bash: |
+            set -uo pipefail
+            r=$plan_round.output
+            if [ "$r" = approach ]; then printf 'ask\n'; exit 0; fi
+            s=$spec.output
+            [ -n "$s" ] || { printf 'no-ask\n'; exit 0; }
+            printf '%s' "$s" > "$ARTIFACTS_DIR/spec-approved.json"
+            proposed=$(printf '%s' "$s" | jq -c '.handoffs // []' 2> /dev/null || printf '[]')
+            : > "$ARTIFACTS_DIR/handoffs-dropped.txt"
+            if ! printf '%s' "$proposed" | "${ARCHON_HOME:-$HOME/.archon}/scripts/start-run.sh" check --also build - > "$ARTIFACTS_DIR/handoffs-approved.json" 2> "$ARTIFACTS_DIR/handoffs-dropped.txt"; then
+              printf '[]\n' > "$ARTIFACTS_DIR/handoffs-approved.json"
+              printf 'start-run.sh check failed\n' >> "$ARTIFACTS_DIR/handoffs-dropped.txt"
+            fi
+            gaps=$(printf '%s' "$s" | jq '(.gaps // []) | length' 2> /dev/null || echo 0)
+            builds=$(jq '[.[] | select(.workflow == "build")] | length' "$ARTIFACTS_DIR/handoffs-approved.json" 2> /dev/null || echo 0)
+            grep '^start-run' "$ARTIFACTS_DIR/handoffs-dropped.txt" > "$ARTIFACTS_DIR/plan-defects.txt"
+            if [ "${gaps:-0}" -gt "${builds:-0}" ]; then
+              printf '%s thing(s) are not put live by any declared hand-off, and the plan proposes %s build hand-off(s)\n' "$gaps" "$builds" >> "$ARTIFACTS_DIR/plan-defects.txt"
+            fi
+            if [ -s "$ARTIFACTS_DIR/plan-defects.txt" ]; then
+              cat "$ARTIFACTS_DIR/plan-defects.txt" >&2
+              exit 1
+            fi
+            n=$(jq 'length' "$ARTIFACTS_DIR/handoffs-approved.json" 2> /dev/null || echo 0)
+            if printf '%s' "$s" | grep -qE '"needs_decision"[[:space:]]*:[[:space:]]*true' || [ "${n:-0}" -gt 0 ]; then
+              printf 'ask\n'
+            else
+              printf 'no-ask\n'
+            fi
+          mutates_checkout: false
+
+        # The plan as a page, at a stable path, built by report.sh (the repository's report_cmd, else
+        # the kit's page, else a plain one), and a line
+        # naming the hand-offs the run will start after delivery, and the planner's question when it
+        # asked one. The gate shows only this node's output, because in an approach round `spec` did
+        # not run and a reference to its output fails. An approach round builds approach.md as a page
+        # of kind `approach` beside the plan report, and its message follows the same contract: the
+        # link, the approach's opening paragraph (a fixed sentence when the file has none), then what each answer does. A page of options the planner
+        # built is first copied to a stable path outside the run's artifacts, which stays alive
+        # across rounds, and the report includes its sections. Only when every builder fails does
+        # a sentence stand in the page's place, so the pause still happens.
+        - id: plan_report
+          depends_on: [plan_record]
+          when: "$plan_record.output == 'ask'"
+          bash: |
+            set -uo pipefail
+            r=$plan_round.output
+            slug=$intake.output
+            dir=$("${ARCHON_HOME:-$HOME/.archon}/scripts/build-settings.sh" --design-dir "$slug")
+            # Prints approach.md's opening paragraph as one plain line of at most 400 characters, or nothing.
+            approach_paragraph() {
+              local t
+              t=$(awk '
+                st == 0 { if ($0 ~ /^[ \t]*$/) next; st = 1; if ($0 ~ /^# /) next }
+                st == 1 { if ($0 ~ /^[ \t]*$/) next; st = 2; first = 1 }
+                st == 2 {
+                  if ($0 ~ /^[ \t]*$/) exit
+                  if ($0 ~ /^[ \t]*(#|>|\||[-*+] |[0-9]+\. )/) exit
+                  if (first && $0 ~ /^(Files|Tests|Open)[^:]*:/) exit
+                  first = 0
+                  out = (out == "" ? $0 : out " " $0)
+                }
+                END { print out }' "$1")
+              t=$(printf '%s' "$t" | sed -E \
+                -e 's/`//g' \
+                -e 's/\[([^]]*)\]\([^)]*\)/\1/g' \
+                -e 's/(\*\*|__)//g' \
+                -e 's/(^|[^[:alnum:]_*])[*_]+/\1/g' \
+                -e 's/[*_]+($|[^[:alnum:]_*])/\1/g' \
+                -e 's/[[:space:]]+/ /g; s/^ //; s/ $//')
+              if [ "${#t}" -gt 400 ]; then
+                local w=${t:0:400} cut
+                cut=$(printf '%s' "$w" | awk '{ n = 0; for (i = 1; i <= length($0); i++) { c = substr($0, i, 1); if ((c == "." || c == "!" || c == "?") && (i == length($0) || substr($0, i + 1, 1) == " ")) n = i } print n }')
+                if [ "$cut" -gt 0 ]; then
+                  t=${w:0:cut}
+                else
+                  w=${t:0:397}; w=${w% *}; t="$w..."
+                fi
+              fi
+              printf '%s' "$t"
+            }
+            if [ "$r" = approach ]; then
+              if [ -s "$ARTIFACTS_DIR/approach.md" ]; then
+                "${ARCHON_HOME:-$HOME/.archon}/scripts/report.sh" markdown approach --report "$ARTIFACTS_DIR/approach.md" \
+                  --out "$dir/approach-report.html" --design "$slug" --run "$(basename "$ARTIFACTS_DIR")" \
+                  --artifacts "$ARTIFACTS_DIR" --status "Approach, before the full plan"
+                para=$(approach_paragraph "$ARTIFACTS_DIR/approach.md")
+                if [ -n "$para" ]; then
+                  printf '%s\n' "$para"
+                else
+                  printf 'The approach is ready: the choices still open, the files it touches and the tests that prove it.\n'
+                fi
+              else
+                printf 'The approach node wrote no approach.md.\n'
+              fi
+              printf 'approve starts the full plan from this approach. rework asks for another approach with your note.\n'
+              exit 0
+            fi
+            src="$ARTIFACTS_DIR/plan"
+            if [ -f "$src/index.html" ]; then
+              rm -rf "$dir/plan"
+              mkdir -p "$dir/plan"
+              cp -r "$src/." "$dir/plan/"
+            fi
+            opt=""; [ ! -f "$dir/plan/index.html" ] || opt="--options-page plan/index.html"
+            # shellcheck disable=SC2086
+            "${ARCHON_HOME:-$HOME/.archon}/scripts/report.sh" page plan --out "$dir/plan-report.html" --design "$slug" \
+              --run "$(basename "$ARTIFACTS_DIR")" --artifacts "$ARTIFACTS_DIR" --spec "$ARTIFACTS_DIR/spec-approved.json" $opt
+            # The planner's summary opens the plan page, so its opening paragraph opens the message.
+            jq -r '.summary // empty' "$ARTIFACTS_DIR/spec-approved.json" > "$ARTIFACTS_DIR/plan-summary.md" 2> /dev/null
+            para=$(approach_paragraph "$ARTIFACTS_DIR/plan-summary.md")
+            [ -z "$para" ] || printf '%s\n' "$para"
+            h=$(jq -r '[.[] | "\(.workflow) \(.inputs | map("\(.name)=\(.value)") | join(" "))" | rtrimstr(" ")] | join("; ")' \
+              "$ARTIFACTS_DIR/handoffs-approved.json" 2> /dev/null)
+            [ -z "$h" ] || printf 'After delivery this run starts: %s\n' "$h"
+            q=$(jq -r '.question // empty' "$ARTIFACTS_DIR/spec-approved.json" 2> /dev/null)
+            [ -z "$q" ] || printf '%s\n' "$q"
+            printf 'approve starts the build of this plan. rework asks for a new plan with your note.\n'
+          mutates_checkout: false
+
+        - id: plan_gate
+          depends_on: [plan_report]
+          when: "$plan_record.output == 'ask'"
+          wait:
+            attention: |
+              $plan_report.output
+            form: select
+            options:
+              - { id: approve, label: Approve }
+              - { id: rework, label: Rework with my note }
+
+  # The plan loop is skipped in a reused run, so this runs after a skipped dependency. It must
+  # not run after a failed one: a plan_cycle that fails, as when the provider's usage limit
+  # pauses the run, would fail this node too, and Archon keeps that failure across the resume.
+  - id: plan_decision
+    depends_on: [plan_cycle, reuse]
+    trigger_rule: none_failed_min_one_success
+    bash: |
+      set -uo pipefail
+      d=$("${ARCHON_HOME:-$HOME/.archon}/scripts/state.sh" get plan-decision)
+      [ -n "$d" ] || { printf 'no plan decision was recorded\n' >&2; exit 1; }
+      printf '%s\n' "$d"
+    mutates_checkout: false
+
+  # Prints `run` when the tests stage should happen and `skip` when the run adopted an earlier
+  # run's plan and tests. Before `run` it tells lane-hook.mjs that the tests stage is running.
+  # `red_check` ends the stage.
+  - id: tests_go
+    depends_on: [plan_decision]
+    bash: |
+      set -uo pipefail
+      d=$plan_decision.output
+      if [ "$d" != approve ]; then printf 'skip\n'; exit 0; fi
+      "${ARCHON_HOME:-$HOME/.archon}/scripts/lane.sh" stage tests "$ARTIFACTS_DIR" || exit 1
+      printf 'run\n'
+    mutates_checkout: false
+
+  - id: tests
+    depends_on: [tests_go]
+    when: "$tests_go.output == 'run'"
+    model: medium
+    prompt: |
+      Write the tests for the plan at $ARTIFACTS_DIR/plan.md. Read the plan and the code it
+      names first, then follow the repository's existing test conventions, which its
+      CLAUDE.md describes. The design or brief is in $brief_location.output/. Read
+      .archon/build-notes/tests.md if it exists and follow it.
+
+      Where the plan excuses a stage, the plan wins over this prompt on that point. When it
+      excuses red_check, the new tests pass on the current code: run
+      `bash "${ARCHON_HOME:-$HOME/.archon}/scripts/mutation-check.sh" --schema` and write
+      $ARTIFACTS_DIR/mutations.json as it describes. When it excuses mutation_cycle as well,
+      the brief changes prose only: write no tests and no mutations.json.
+
+      Write tests that fail now and pass once the implementation lands. Assert the
+      behaviour the plan describes, not the shape of an implementation that does not exist
+      yet. Do not implement the change: another agent does that, and what you write here is
+      the only thing that will prove its work.
+
+      You may change only paths matching the tests lane:
+      $lanes_declared.output
+
+      A hook refuses a write anywhere else, a one-line fix to a source file included, and a
+      write outside the worktree except to the temp directory and $ARTIFACTS_DIR. The hook
+      sees the Write and Edit tools and the common shell forms; a script that writes there is
+      still a violation. When the plan cannot be tested without a source change, such as a
+      missing header or a seam that does not exist, write the test the way it should read
+      and record what is missing in $ARTIFACTS_DIR/tests-notes.md.
+
+      Run the repository's test commands yourself before you finish and read their output.
+      The new tests must fail because the behaviour does not exist yet, and every
+      pre-existing test must still pass: a new test file that breaks the existing suite is
+      a fault in your work, and the implementer cannot repair it, because it may not change
+      this lane. A fresh worktree has no installed dependencies, so install them before you
+      run the commands.
+
+      Commit with the message style `<subsystem>: <description>`. Do not push.
+
+  # Prints `red` when the tests fail as new tests should, `mutate` when they pass and the plan
+  # excuses this check, which hands the tests to `mutation_cycle`, and `prose` when the plan
+  # excuses `mutation_cycle` too, which skips it: `impl_join` then confines the implementer to
+  # the docs set. Later nodes compare the whole output with one word, so the gate table goes to
+  # run.log and the messages to stderr.
+  - id: red_check
+    depends_on: [tests]
+    # A timeout stops a hang and is not a budget. A node that times out fails, which fails its loop
+    # and the run and leaves the worktree for a person. An hour is about nine times the longest gate
+    # run on record, 413 s.
+    timeout: 3600000
+    bash: |
+      set -uo pipefail
+      "${ARCHON_HOME:-$HOME/.archon}/scripts/lane.sh" unstage --verify || exit 1
+      if "${ARCHON_HOME:-$HOME/.archon}/scripts/run-log.sh" red-check bash "${ARCHON_HOME:-$HOME/.archon}/scripts/run-gates.sh" tests; then
+        if "${ARCHON_HOME:-$HOME/.archon}/scripts/plan-excuses.sh" has red_check; then
+          if "${ARCHON_HOME:-$HOME/.archon}/scripts/plan-excuses.sh" has mutation_cycle; then
+            printf 'the tests pass and the plan excuses the mutation check: prose only, checked after the implementer\n' >&2; printf 'prose\n'; exit 0
+          fi
+          printf 'the tests pass, as the plan says; the mutation check proves them\n' >&2; printf 'mutate\n'; exit 0
+        fi
+        printf 'the tests gate set passed with the new tests in place, so they prove nothing\n' >&2
+        exit 1
+      fi
+      printf 'the tests gate set fails, as new tests should before the change\n' >&2
+      "${ARCHON_HOME:-$HOME/.archon}/scripts/state.sh" set red-ok ok
+      printf 'red\n'
+
+  # Runs when the plan excused `red_check`. It loops until the mutation check catches every
+  # mutation in mutations.json: `mut_fix` strengthens the tests or corrects the mutations, and
+  # `lane_mut` confirms it stayed in the tests lane. When `mut_run` prints `retry` it has
+  # lane-hook.mjs confine `mut_fix` to the tests lane, and `lane_mut` ends that and checks the
+  # diff too, because the hook does not see an interpreter's writes. A coverage-bug.md written by
+  # `mut_fix` makes the next `mut_run` fail the run.
+  - id: mutation_cycle
+    depends_on: [red_check]
+    when: "$red_check.output == 'mutate'"
+    loop_group:
+      max_iterations: 5
+      fresh_context: true
+      until_bash: '[ "$("${ARCHON_HOME:-$HOME/.archon}/scripts/state.sh" get mutation-status)" = caught ]'
+      nodes:
+        - id: mut_run
+          timeout: 3600000
+          bash: |
+            set -uo pipefail
+            r=$(bash "${ARCHON_HOME:-$HOME/.archon}/scripts/mutation-check.sh" "$ARTIFACTS_DIR/mutations.json" "$ARTIFACTS_DIR/mutation-report.md") || exit 1
+            if [ "$r" = retry ]; then "${ARCHON_HOME:-$HOME/.archon}/scripts/lane.sh" stage tests "$ARTIFACTS_DIR" || exit 1; fi
+            printf '%s\n' "$r"
+
+        - id: mut_fix
+          depends_on: [mut_run]
+          when: "$mut_run.output == 'retry'"
+          model: medium
+          allowed_tools: [Read, Grep, Glob, Bash, Write, Edit]
+          prompt: |
+            The mutation check applied every mutation in $ARTIFACTS_DIR/mutations.json at once,
+            ran the tests once and wrote $ARTIFACTS_DIR/mutation-report.md. Read it and
+            $ARTIFACTS_DIR/plan.md. For each mutation that was not caught, either add or
+            strengthen a test so it fails under that mutation, or correct the entry in
+            mutations.json when the entry is wrong (a `from` that is not unique, a
+            `fail_pattern` that does not match the runner's failure line, an edit that does not
+            break the behaviour). When mutations.json is missing or does not match its schema,
+            write it as `bash "${ARCHON_HOME:-$HOME/.archon}/scripts/mutation-check.sh" --schema` describes.
+            Never remove a mutation or weaken a test to raise the count. When the report says
+            the tests fail on the unmodified code, fix the test; when that shows a real bug in
+            the source, write $ARTIFACTS_DIR/coverage-bug.md and stop. You may change only paths
+            matching: $lanes_declared.output. Commit with the message style
+            `<subsystem>: <description>`. Do not push.
+
+        # This check and the two in `impl_skipped` and `impl_join` list what the run has changed
+        # since its branch left the base branch (`fork-ref`), without the brief (`brief-path`),
+        # which is all that was on the branch before the tests stage began. Nothing recorded is a
+        # commit, so a rebase in `sync_cycle` cannot make them wrong, and an adopting run, whose
+        # branch was rebased, is checked the same way.
+        - id: lane_mut
+          depends_on: [mut_fix]
+          bash: |
+            set -uo pipefail
+            st="${ARCHON_HOME:-$HOME/.archon}/scripts/state.sh"
+            "${ARCHON_HOME:-$HOME/.archon}/scripts/lane.sh" unstage
+            bash "${ARCHON_HOME:-$HOME/.archon}/scripts/lane.sh" check --allow-empty --since "$("$st" get fork-ref)" --exclude "$("$st" get brief-path)" in
+          mutates_checkout: false
+
+  # An adopting run skips the tests stage, so the build loop cannot depend on `red_check`
+  # alone. This prints `go` for an adopting run, for tests that failed as they should, for tests
+  # that the mutation check caught, and for a prose-only plan that skipped both checks. It fails
+  # when none holds, so a resume reruns it once the tests stage has run.
+  - id: build_go
+    depends_on: [reuse, red_check, mutation_cycle]
+    trigger_rule: none_failed_min_one_success
+    bash: |
+      set -uo pipefail
+      s=$reuse.output; r=$red_check.output
+      if [ "$s" = reused ]; then printf 'go\n'; exit 0; fi
+      if [ "$r" = mutate ]; then
+        [ "$("${ARCHON_HOME:-$HOME/.archon}/scripts/state.sh" get mutation-status)" = caught ] && { printf 'go\n'; exit 0; }
+      elif [ "$r" = prose ]; then printf 'go\n'; exit 0
+      elif [ "$("${ARCHON_HOME:-$HOME/.archon}/scripts/state.sh" get red-ok)" = ok ]; then printf 'go\n'; exit 0; fi
+      printf 'the tests stage did not finish, so the build loop has nothing to build against\n' >&2
+      exit 1
+    mutates_checkout: false
+
+  - id: build_cycle
+    depends_on: [build_go]
+    loop_group:
+      # Thirty rounds, counting automatic fixes, owner rework and, in an interactive run, each
+      # question the implementer asks. Five not-ready rounds in a row fail the run before the cap
+      # (see `ready`), so the cap ends only a run that keeps passing and being sent back.
+      max_iterations: 30
+      fresh_context: true
+      until_bash: '[ "$("${ARCHON_HOME:-$HOME/.archon}/scripts/state.sh" get build-loop)" = settled ]'
+      nodes:
+        # A resumed run restarts this loop at its failed round, which can leave the marker of a
+        # stage that never reached its end, so each round starts by clearing it.
+        #
+        # An answer is read here, in the round after its pause. At a pause where the implementer
+        # asked a question (`pause-kind` ask) any answer continues the build: the text goes to
+        # owner-notes.md for the next implementer, and `approve` also sets `ask-stop`, so the
+        # work is finished and reviewed without asking again. `reply` at any other pause counts
+        # as `rework`.
+        - id: round
+          bash: |
+            set -uo pipefail
+            st="${ARCHON_HOME:-$HOME/.archon}/scripts/state.sh"
+            "${ARCHON_HOME:-$HOME/.archon}/scripts/lane.sh" unstage
+            "$st" set gates-status ''
+            "$st" set review-verdict ''
+            "$st" set ask-pending ''
+            if [ "$("$st" get auto-land)" = yes ]; then "$st" set build-loop settled; printf 'idle\n'; exit 0; fi
+            d=$LOOP_PREV.final_gate.output.decision
+            note=$LOOP_PREV.final_gate.output.text
+            kind=$("$st" get pause-kind); kind=${kind:-clean}
+            if [ "$kind" = ask ] && [ -n "$d" ]; then
+              if [ "$d" = approve ]; then
+                "$st" set ask-stop yes
+                printf '## Answer\n\nThe owner chose to finish without answering. Do not ask again: finish the work, deciding for yourself what you would have asked.\n\n' >> "$ARTIFACTS_DIR/owner-notes.md"
+              else
+                printf '## Answer\n\n' >> "$ARTIFACTS_DIR/owner-notes.md"
+              fi
+              [ -z "$note" ] || printf '%s\n\n' "$note" >> "$ARTIFACTS_DIR/owner-notes.md"
+              d=rework
+            fi
+            [ "$d" = reply ] && d=rework
+            if [ "$d" = rework ]; then "$st" set not-ready-rounds 0; "$st" set owner-reworked yes; fi
+            if [ -z "$d" ] || [ "$d" = rework ]; then
+              "$st" set auto-land ''
+              "$st" set build-loop open
+              printf 'build\n'
+            else
+              "$st" set build-loop settled
+              printf 'idle\n'
+            fi
+          mutates_checkout: false
+
+        # The implementer reports a test it cannot satisfy in blocked.md and stops. The next
+        # round hands that report to an agent that did not write the implementation, and
+        # only then does the implementer run again. Before `repair` this node records the commit
+        # the repair starts from, for `repair_state`'s range list, and tells lane-hook.mjs that
+        # the repair stage is running. `repair_state` ends the stage.
+        - id: repair_ready
+          depends_on: [round]
+          bash: |
+            set -uo pipefail
+            r=$round.output
+            [ "$r" = build ] || { printf 'idle\n'; exit 0; }
+            [ -f "$ARTIFACTS_DIR/blocked.md" ] || { printf 'no-repair\n'; exit 0; }
+            rm -f "$ARTIFACTS_DIR/repair-declined.md"
+            sha=$(git rev-parse HEAD) || exit 1
+            "${ARCHON_HOME:-$HOME/.archon}/scripts/state.sh" set repair-sha "$sha"
+            "${ARCHON_HOME:-$HOME/.archon}/scripts/lane.sh" stage repair "$ARTIFACTS_DIR" || exit 1
+            printf 'repair\n'
+          mutates_checkout: false
+
+        - id: repair_tests
+          depends_on: [repair_ready]
+          when: "$repair_ready.output == 'repair'"
+          model: medium
+          prompt: |
+            Repair the tests that the implementer reports it cannot satisfy. You did not write
+            them and you did not write the implementation. Read $ARTIFACTS_DIR/blocked.md
+            first: it names each test and says what the implementer thinks it should assert.
+            Then read $ARTIFACTS_DIR/plan.md, $brief_location.output/ and the
+            repository's CLAUDE.md. Read .archon/build-notes/tests.md if it exists and follow
+            it: it binds the tests you repair as it binds the ones the test author wrote.
+
+            For each test named, decide whether the test is wrong. Run it and read the code
+            under test. A test is wrong when the approved design or brief, or a rule that an
+            existing test pins, makes its assertion unsatisfiable. A test is not wrong because
+            it is hard to satisfy.
+
+            When a test is wrong, change that assertion to the strongest statement the
+            approved behaviour supports. Never weaken an assertion to less than that, never
+            remove a check, and never delete or skip a test. When the implementer is wrong,
+            change nothing and write $ARTIFACTS_DIR/repair-declined.md saying what it must do
+            and why.
+
+            You may change only paths matching the tests lane:
+            $lanes_declared.output
+
+            A hook refuses a write anywhere else, and a write outside the worktree except to the
+            temp directory and $ARTIFACTS_DIR. The hook sees the Write and Edit tools and the
+            common shell forms; a script that writes there is still a violation.
+
+            Append to $ARTIFACTS_DIR/test-repairs.md, for each test: the file and name, the old
+            assertion, the new one, and the evidence that the old one could not hold, or why
+            you declined. Delete $ARTIFACTS_DIR/blocked.md. Run the tests gate set and read its
+            output.
+            Commit with the message style `<subsystem>: <description>`. Do not push.
+          allowed_tools: [Read, Grep, Glob, Bash, Write, Edit]
+
+        # Ends the repair stage's confinement. lane-hook.mjs refused any write outside the tests
+        # lane while the stage ran, so what is left is committed, and the implementer starts
+        # from a clean tree.
+        - id: repair_state
+          depends_on: [repair_ready, repair_tests]
+          trigger_rule: none_failed_min_one_success
+          bash: |
+            set -uo pipefail
+            "${ARCHON_HOME:-$HOME/.archon}/scripts/lane.sh" unstage --verify || exit 1
+            w=$repair_ready.output
+            case "$w" in
+              idle) printf 'idle\n'; exit 0 ;;
+              no-repair) printf 'go\n'; exit 0 ;;
+            esac
+            base=$("${ARCHON_HOME:-$HOME/.archon}/scripts/state.sh" get repair-sha)
+            # The repair is committed here, so the implementer starts from a clean tree.
+            if [ -n "$(git status --porcelain)" ]; then
+              git add -A && git commit -q -m "tests: repair the tests the implementer could not satisfy"
+            fi
+            [ "$(git rev-parse HEAD)" = "$base" ] || printf '%s %s\n' "$base" "$(git rev-parse HEAD)" >> "$ARTIFACTS_DIR/repair-ranges.txt"
+            printf 'go\n'
+
+        # Prints `run` when the implementer should work, `skip` when the plan excused the stage,
+        # and `idle` when the round has no build work. `impl_skipped` runs for `skip`. Before
+        # `run` it tells lane-hook.mjs that the implement stage is running. The marker stays
+        # through `review`, which writes only to the artifacts directory and the temp directory,
+        # and `gates` ends it.
+        - id: impl_go
+          depends_on: [repair_state]
+          bash: |
+            set -uo pipefail
+            r=$repair_state.output
+            if [ "$r" != go ]; then printf 'idle\n'; exit 0; fi
+            if "${ARCHON_HOME:-$HOME/.archon}/scripts/plan-excuses.sh" has implement; then
+              printf 'skip\n'; exit 0
+            fi
+            "${ARCHON_HOME:-$HOME/.archon}/scripts/lane.sh" stage implement "$ARTIFACTS_DIR" || exit 1
+            printf 'run\n'
+          mutates_checkout: false
+
+        - id: implement
+          depends_on: [impl_go]
+          when: "$impl_go.output == 'run'"
+          model: medium
+          prompt: |
+            Make the failing tests pass by implementing the plan at $ARTIFACTS_DIR/plan.md.
+            Read the repository's CLAUDE.md first. The approved design or brief is in
+            $brief_location.output/; the plan says how to build it, and where the two
+            seem to differ, the approved design is what the owner agreed to. Read
+            .archon/build-notes/implement.md if it exists and follow it.
+
+            Read first, when each exists:
+
+            - $ARTIFACTS_DIR/plan.md, the plan this implements.
+            - $ARTIFACTS_DIR/plan-notes.md, what the owner said at the plan gate, oldest
+              note first, absent when they raised nothing there.
+            - $ARTIFACTS_DIR/tests-notes.md, what the test author found missing.
+            - $ARTIFACTS_DIR/owner-notes.md, the questions asked of the owner and their
+              answers, oldest first, absent until a question was asked. Carry on from the last
+              answer, and do not ask again what an answer already settled.
+            - $ARTIFACTS_DIR/repair-declined.md, when the repair stage judged a test you
+              reported as blocked to be right: it says what you must do instead.
+            - $ARTIFACTS_DIR/gate-report.md, from the second round on, naming each failing
+              gate with its output.
+            - $ARTIFACTS_DIR/report.md, the previous round's review. Fix every blocking
+              finding, or leave the evidence that it is not one.
+            - the plan's "## Excused" section, when it has one. It wins over this prompt on that
+              point.
+
+            You may not change any path matching the tests lane:
+            $lanes_declared.output
+
+            A hook refuses a write to them, and a write outside the worktree except to the temp
+            directory and $ARTIFACTS_DIR. Deleting or skipping a test counts as changing it.
+            The hook sees the Write and Edit tools and the common shell forms; a script that
+            writes there is still a violation. When a test is itself wrong and no
+            implementation can satisfy it, write $ARTIFACTS_DIR/blocked.md naming the test and
+            what it should have asserted, commit everything else first, then stop; the next
+            round's `repair_tests` stage checks your claim. Weakening the test is not an option
+            open to you.
+
+            Do not edit .archon/gates.json, .archon/lanes.json, .archon/build.json or the
+            approved design or brief in $brief_location.output/.
+
+            Update the documentation the plan lists.
+
+            Whether the owner can be asked during this build: $ask_mode.output. When it is yes,
+            you may stop and ask them a question, as often as the work needs. Ask only for what
+            the code, the documentation and the commands you can run cannot give you, such as
+            what a device showed or a choice that only they can make, and ask one question at a
+            time. The plan's "## Checkpoints" section, when it has one, says where the planner
+            expected you to stop. Commit your work first, because the run saves nothing that is
+            not committed. Then return `ask` true, the `question` in a sentence or two and the
+            `steps` the owner has to take, at most ten short lines, and stop. When more detail is
+            needed, commit a document that holds it and name its path in `steps`. To have the run
+            start a workflow before the owner is asked, such as a deploy-staging run of the commit you just
+            made, list it in `handoffs` with the inputs it asks for and a `note` that says what it
+            should do. List only workflows from this list, each only for work its "use when"
+            covers, and none when no entry fits:
+            $handoffs_declared.output
+            The review and the gates run only after a round that asks nothing, so a round that
+            asks may leave work unfinished. When the work is done, or when the answer above is no,
+            return `ask` false and leave `question`, `steps` and `handoffs` empty.
+
+            What the owner said at the last pause, empty until they have: an answer to your
+            question, or what they asked for after reading the finished work:
+            $LOOP_PREV.final_gate.output.text
+
+            Commit with the message style `<subsystem>: <description>`. Uncommitted changes
+            are not delivered. Do not push.
+          output_format:
+            type: object
+            properties:
+              ask: { type: boolean }
+              question: { type: string }
+              steps: { type: string }
+              handoffs:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    workflow: { type: string }
+                    inputs:
+                      type: array
+                      items:
+                        type: object
+                        properties: { name: { type: string }, value: { type: string } }
+                        required: [name, value]
+                    note: { type: string }
+                  required: [workflow, inputs, note]
+            required: [ask, question, steps, handoffs]
+
+        # The plan excused `implement`, so nothing outside the tests lane may have changed
+        # since the tests stage began (see `lane_mut` for what that lists).
+        - id: impl_skipped
+          depends_on: [impl_go]
+          when: "$impl_go.output == 'skip'"
+          bash: |
+            set -uo pipefail
+            st="${ARCHON_HOME:-$HOME/.archon}/scripts/state.sh"
+            bash "${ARCHON_HOME:-$HOME/.archon}/scripts/lane.sh" check --allow-empty --since "$("$st" get fork-ref)" --exclude "$("$st" get brief-path)" in
+          mutates_checkout: false
+
+        # Joins the implement and skip branches, so `review` has one dependency that runs in
+        # either case. An `include:` node's support for `trigger_rule` is unproven, and
+        # `repair_state` already joins branches this way. In the settling round and after an
+        # undone repair both branches are skipped, so this and `review` are skipped as before.
+        # It also enforces a `mutation_cycle` excuse: the whole diff since the tests stage began
+        # must stay inside the docs set, so a test the author wrote fails the run too. An adopted
+        # run is checked as well, because `reuse` copies spec-approved.json.
+        - id: impl_join
+          depends_on: [implement, impl_skipped]
+          trigger_rule: none_failed_min_one_success
+          bash: |
+            set -uo pipefail
+            st="${ARCHON_HOME:-$HOME/.archon}/scripts/state.sh"
+            if "${ARCHON_HOME:-$HOME/.archon}/scripts/plan-excuses.sh" has mutation_cycle; then
+              bash "${ARCHON_HOME:-$HOME/.archon}/scripts/lane.sh" check --set docs --allow-empty --since "$("$st" get fork-ref)" --exclude "$("$st" get brief-path)" in || exit 1
+            fi
+            printf 'ok\n'
+          mutates_checkout: false
+
+        # Prints `ask` when the implementer returned a question in an interactive run and `go`
+        # otherwise. On `ask` it commits what the implementer left, passes the hand-offs it
+        # proposed through `start-run.sh check` (which drops any the repository does not
+        # declare) and starts them on that commit, records the question in owner-notes.md and sets
+        # `ask-pending` in `state`, which `ready` reads. `ask-started` holds the lines that
+        # `start-run.sh start` printed, on one line, because `state.sh` values are one line. It
+        # prints `go` when the run is not interactive, when the output is not a question, and when
+        # `ask-stop` is set because the owner chose to finish without answering. In the settling
+        # round `impl_join` is skipped, so this is too, and so is `review_go`.
+        - id: ask_check
+          depends_on: [impl_join]
+          bash: |
+            set -uo pipefail
+            st="${ARCHON_HOME:-$HOME/.archon}/scripts/state.sh"
+            "$st" set ask-pending ''; "$st" set ask-started ''
+            [ "$("$st" get interactive)" = yes ] || { printf 'go\n'; exit 0; }
+            a=$implement.output
+            printf '%s' "$a" | jq -e '.ask == true and ((.question // "") | length > 0)' > /dev/null 2>&1 || { printf 'go\n'; exit 0; }
+            if [ "$("$st" get ask-stop)" = yes ]; then printf 'the owner chose to finish, so the question is not asked\n' >&2; printf 'go\n'; exit 0; fi
+            bash "${ARCHON_HOME:-$HOME/.archon}/scripts/lane.sh" unstage --verify || exit 1
+            if [ -n "$(git status --porcelain)" ]; then
+              git add -A && git commit -q -m "build: save the work before asking the owner" >&2 || exit 1
+            fi
+            sha=$(git rev-parse HEAD) || exit 1
+            f=$(mktemp); trap 'rm -f "$f"' EXIT
+            printf '%s' "$a" | jq -c '[.handoffs[]? | {workflow, repo: "", inputs, note}]' \
+              | "${ARCHON_HOME:-$HOME/.archon}/scripts/start-run.sh" check - > "$f" || printf '[]\n' > "$f"
+            if [ "$(jq 'length' "$f" 2> /dev/null || echo 0)" -gt 0 ]; then
+              "$st" set ask-started "$("${ARCHON_HOME:-$HOME/.archon}/scripts/start-run.sh" start "$f" "$sha" | awk 'NR > 1 { printf "; " } { printf "%s", $0 }')"
+            fi
+            printf '## Question\n\n%s\n\n' "$(printf '%s' "$a" | jq -r .question)" >> "$ARTIFACTS_DIR/owner-notes.md"
+            "$st" set ask-pending yes
+            printf 'ask\n'
+
+        # Switches the review and the gates off in a round that asks the owner a question. A
+        # dependency that a `when:` skipped skips `review`, which skips `gates`. It uses only a
+        # bash node's `when:`, because `when:` on an `include:` node is unproven.
+        - id: review_go
+          depends_on: [ask_check]
+          when: "$ask_check.output == 'go'"
+          bash: printf 'go\n'
+          mutates_checkout: false
+
+        - id: review
+          depends_on: [review_go]
+          include: review-change
+
+        - id: gates
+          depends_on: [review]
+          timeout: 3600000
+          bash: |
+            set -uo pipefail
+            "${ARCHON_HOME:-$HOME/.archon}/scripts/lane.sh" unstage --verify || exit 1
+            st="${ARCHON_HOME:-$HOME/.archon}/scripts/state.sh"
+            # A gate that fails ends the ordered gates after it, so a red round's report lists only some
+            # of them. The round that can fail the run runs every gate, so the failure names every red
+            # gate; the four rounds before it stay as quick as the first red gate. The 4 here is one
+            # less than the 5 in `ready`, and a test keeps the two together.
+            n=$("$st" get not-ready-rounds); keep=''
+            if [ "${n:-0}" -ge 4 ]; then keep=--keep-going; fi
+            if bash "${ARCHON_HOME:-$HOME/.archon}/scripts/run-gates.sh" feature --clean-tree $keep; then g=green; else g=red; fi
+            "$st" set gates-status "$g"
+            printf '%s\n' "$g"
+
+        # Prints one of five words. `ask` means the implementer asked the owner a question, so the
+        # review and the gates did not run and the round ends at the final pause with `pause-kind`
+        # set to `ask`. `pause` means the round ends at the final pause, which a clean round does so
+        # the owner can land it. `auto` is a clean round that lands without the pause, when kit.json sets auto_land and
+        # nothing needs the owner: the run lands (not a draft pull request), is not interactive, made
+        # no test repairs, the plan asked no question, and the owner has not sent the build back.
+        # It records `auto-land` in state, which `round` reads to settle the loop and
+        # `workflow-cleanup` reads to treat the run as approved. `not-ready` goes straight to another
+        # round, and `idle` is a round with no build work. The fifth not-ready round in a row prints
+        # no word: it exits 1 and says why on standard error, which fails the run. Nothing the owner
+        # could answer would change a red round, so the run ends instead of asking, keeps its branch
+        # and worktree, and `build --adopt` continues from them.
+        - id: ready
+          depends_on: [round, gates]
+          trigger_rule: all_done
+          bash: |
+            set -uo pipefail
+            st="${ARCHON_HOME:-$HOME/.archon}/scripts/state.sh"
+            r=$round.output
+            [ "$r" = build ] || { printf 'idle\n'; exit 0; }
+            if [ "$("$st" get ask-pending)" = yes ]; then "$st" set pause-kind ask; printf 'ask\n'; exit 0; fi
+            g=$("$st" get gates-status); g=${g:-red}
+            v=$("$st" get review-verdict); v=${v:-blocked}
+            if [ "$g" = green ] && [ "$v" = clean ]; then
+              "$st" set pause-kind clean; "$st" set not-ready-rounds 0
+              if [ "$("${ARCHON_HOME:-$HOME/.archon}/scripts/kit-settings.sh" auto_land false)" = true ] \
+                && [ "$("$st" get deliver)" = land ] && [ "$("$st" get interactive)" != yes ] \
+                && [ "$("$st" get owner-reworked)" != yes ] && [ ! -f "$ARTIFACTS_DIR/test-repairs.md" ] \
+                && jq -e '.needs_decision == false' "$ARTIFACTS_DIR/spec-approved.json" > /dev/null 2>&1; then
+                "$st" set auto-land yes; printf 'auto\n'; exit 0
+              fi
+              printf 'pause\n'; exit 0
+            fi
+            n=$("$st" get not-ready-rounds); c=$(( ${n:-0} + 1 )); "$st" set not-ready-rounds "$c"
+            if [ "$c" -ge 5 ]; then
+              # gate-report.md is the last round's, so it says nothing of the earlier four.
+              gs="${ARCHON_HOME:-$HOME/.archon}/scripts/gate-summary.sh"
+              joined() { awk 'NR > 1 { printf ", " } { printf "%s", $0 } END { print "" }'; }
+              names=$(bash "$gs" failed "$ARTIFACTS_DIR/gate-report.md" 2>/dev/null | sed 's/.*/`&`/' | joined)
+              skipped=$(bash "$gs" not-run "$ARTIFACTS_DIR/gate-report.md" feature 2>/dev/null | sed 's/.*/`&`/' | joined)
+              if [ -n "$names" ]; then found="$names failed"
+              elif [ "$g" = green ]; then found='every gate passed'
+              else found='the gates did not finish'; fi
+              {
+                printf 'The build loop stopped: the last 5 rounds in a row did not pass. A round passes when every gate passes and the review says clean. In the last round %s and the review said %s.' "$found" "$v"
+                [ -z "$skipped" ] || printf ' These gates did not run: %s.' "$skipped"
+                printf '\nThe branch keeps its commits in %s. To continue from it, run `archon workflow run build --adopt %s --detach` from the repository.\n' "$(pwd)" "$(basename "$ARTIFACTS_DIR")"
+              } >&2
+              exit 1
+            fi
+            printf 'not-ready\n'
+          mutates_checkout: false
+
+        # What the finished change really looks like, from the repository's shots_cmd. A
+        # repository without one gets an empty directory. A failure is not fatal. The 120 s
+        # limit ends a command that hangs after finishing; a screenshot command normally takes seconds. The
+        # report node uses the same limit.
+        - id: shots
+          depends_on: [ready]
+          when: "$ready.output == 'pause' || $ready.output == 'auto'"
+          bash: |
+            set -uo pipefail
+            slug=$intake.output
+            tmo=$(command -v timeout || command -v gtimeout || printf timeout)
+            shots_cmd=$("${ARCHON_HOME:-$HOME/.archon}/scripts/build-settings.sh" shots_cmd)
+            out="$("${ARCHON_HOME:-$HOME/.archon}/scripts/build-settings.sh" --design-dir "$slug")/built"
+            rm -rf "$out"; mkdir -p "$out"
+            [ -z "$shots_cmd" ] || "${ARCHON_HOME:-$HOME/.archon}/scripts/run-log.sh" shots "$tmo" -k 5 120 bash -c "$shots_cmd \"\$@\"" shots --out "$out" || true
+          mutates_checkout: false
+
+        # Chooses what the owner reads of the diff; the repository's report_cmd draws it.
+        - id: report_pick
+          depends_on: [ready]
+          when: "$ready.output == 'pause' || $ready.output == 'auto'"
+          model: medium
+          mutates_checkout: false
+          allowed_tools: [Read, Grep, Glob, Bash]
+          prompt: |
+            Choose what the owner must read to trust this change, for a report they open in a
+            browser. Read $ARTIFACTS_DIR/plan.md, `git diff --stat "$sync_base.output"...HEAD`, the review at
+            $ARTIFACTS_DIR/report.md, $ARTIFACTS_DIR/owner-notes.md when it exists, and the diff itself
+            where you need it.
+
+            Return `findings` first. When owner-notes.md holds answers the owner gave during the run, such
+            as a measurement they took, something they tried or a choice they made, write at most three
+            sentences that say what those answers showed, with their numbers, and what the change
+            records of them. Say so when the change records more than the answers support or less than
+            they showed. The owner reads these sentences before anything else and the pause message
+            prints them, so write them as plain sentences that stand alone and describe no code. Return an
+            empty string when there is no owner-notes.md or it holds no answers.
+
+            Return `summary`: five to eight sentences on what changed and why, for someone who has not
+            read the plan. Open it with whether the change does what was asked, and name any departure
+            from the plan. Return `open_items`: every caveat, unverified item, step to take after
+            landing and test that was declined, which report.md or the plan lists as still open, one
+            sentence each, and an empty array when there are none. report.md was written before the
+            gates ran, and $ARTIFACTS_DIR/gate-report.md has their result. Leave out an item that only
+            says a gate, the full feature gate or a test run had not run when the review was written,
+            and keep an item for a gate that failed or was skipped in gate-report.md and for anything
+            that report does not cover. Return `picks`: the changes worth reading, each a `path`, a line range
+            `from` and `to` in the new version of the file (at most 60 lines) and one sentence `why`
+            it matters. Pick behaviour changes, new interfaces and anything risky or surprising.
+            Skip generated files, golden frames, lockfiles, renames and mechanical edits. Choose at
+            most 10 files and 14 picks. Return `extra_json`: an empty string, unless
+            .archon/build-notes/report.md exists and says what to put there. Change nothing.
+          output_format:
+            type: object
+            properties:
+              findings: { type: string }
+              summary: { type: string }
+              open_items: { type: array, items: { type: string } }
+              picks:
+                type: array
+                items:
+                  type: object
+                  properties: { path: { type: string }, from: { type: integer }, to: { type: integer }, why: { type: string } }
+                  required: [path, from, to, why]
+              extra_json: { type: string }
+            required: [findings, summary, picks, open_items, extra_json]
+
+        # The review report, at a stable path, built by report.sh as the plan's is, and the
+        # pause message: the report's link, the situation in a sentence, and a line each for
+        # test repairs and excuses when there were any. Only when every builder fails does a
+        # sentence naming report.md stand in the link's place, so the pause still happens. Archon prints each answer's `respond` command below the message, so the
+        # message does not.
+        #
+        # It runs for `ask` too, when `report_pick` and `shots` are skipped, so it takes
+        # `none_failed_min_one_success` and `ready` is its successful dependency. The message of an
+        # `ask` round is the question, the steps and the hand-offs started, in plain text and
+        # with no page, because the pause message is the only thing the owner reads there. An `auto`
+        # round builds the page and prints one line, with no pause after it.
+        - id: report
+          depends_on: [ready, report_pick, shots]
+          trigger_rule: none_failed_min_one_success
+          when: "$ready.output == 'pause' || $ready.output == 'ask' || $ready.output == 'auto'"
+          bash: |
+            set -uo pipefail
+            r=$ready.output
+            if [ "$r" = ask ]; then
+              a=$implement.output
+              printf '%s\n' "$(printf '%s' "$a" | jq -r .question)"
+              printf '%s' "$a" | jq -r 'select((.steps // "") != "") | .steps'
+              s=$("${ARCHON_HOME:-$HOME/.archon}/scripts/state.sh" get ask-started); [ -z "$s" ] || printf 'Started: %s\n' "$s"
+              printf 'reply keeps building with your answer. approve skips the question and finishes the work with what exists.\n'
+              exit 0
+            fi
+            slug=$intake.output
+            p=$report_pick.output
+            base=$sync_base.output
+            # Matched here and not in `handoff`: after landing the branch equals the base and its diff is empty.
+            "${ARCHON_HOME:-$HOME/.archon}/scripts/publish-match.sh" "$base" HEAD > "$ARTIFACTS_DIR/publish-matched.json" || exit 1
+            pm=$(jq -r '[.[] | "publish \(.inputs[] | select(.name == "target") | .value)"] | join("; ")' "$ARTIFACTS_DIR/publish-matched.json")
+            pmline=""
+            if [ -n "$pm" ]; then
+              if [ "$("${ARCHON_HOME:-$HOME/.archon}/scripts/state.sh" get deliver)" = draft-pr ]; then
+                pmline="Not started by this run, because it delivers a draft pull request: $pm"
+              else
+                pmline="After landing this run also starts: $pm"
+              fi
+            fi
+            printf '%s' "$p" > "$ARTIFACTS_DIR/report-picks.json"
+            d=$("${ARCHON_HOME:-$HOME/.archon}/scripts/build-settings.sh" --design-dir "$slug")
+            "${ARCHON_HOME:-$HOME/.archon}/scripts/report.sh" page review --out "$d/review-report.html" --design "$slug" \
+              --run "$(basename "$ARTIFACTS_DIR")" --artifacts "$ARTIFACTS_DIR" --base "$base" --head HEAD \
+              --picks "$ARTIFACTS_DIR/report-picks.json" --shots "$d/built"
+            if [ "$r" = auto ]; then
+              printf '%s is built, reviewed and green. auto_land is set, so the run lands it without waiting.\n' "$slug"
+              [ -z "$pmline" ] || printf '%s\n' "$pmline"
+              exit 0
+            fi
+            st="${ARCHON_HOME:-$HOME/.archon}/scripts/state.sh"
+            if [ "$("$st" get deliver)" = draft-pr ]; then
+              printf '%s is built, reviewed and green, and waits for you to open its draft pull request.\n' "$slug"
+            else
+              printf '%s is built, reviewed and green, and waits for you to land it.\n' "$slug"
+            fi
+            [ -z "$pmline" ] || printf '%s\n' "$pmline"
+            # What the owner's own answers showed, which the page also opens with. It is empty for a run
+            # that asked the owner nothing.
+            found=$(printf '%s' "$p" | jq -r '.findings // ""' 2>/dev/null | tr '\n' ' ' | sed 's/ *$//')
+            if [ -n "$found" ]; then printf '%s\n' "$found"; fi
+            open=$(printf '%s' "$p" | jq -r '[.open_items[]? | select(type == "string" and test("[^[:space:]]"))] | length' 2>/dev/null)
+            if [ "${open:-0}" -eq 1 ]; then
+              printf '1 open item is listed on the page.\n'
+            elif [ "${open:-0}" -gt 1 ]; then
+              printf '%s open items are listed on the page.\n' "$open"
+            fi
+            n=$(grep -c '^## ' "$ARTIFACTS_DIR/test-repairs.md" 2>/dev/null || true)
+            if [ "${n:-0}" -gt 0 ]; then
+              printf '%s test(s) changed by the repair stage; the report lists them after its summary.\n' "$n"
+            fi
+            "${ARCHON_HOME:-$HOME/.archon}/scripts/plan-excuses.sh" lines
+            if "${ARCHON_HOME:-$HOME/.archon}/scripts/plan-excuses.sh" more-tests; then
+              printf 'More tests need another run: a rework note cannot add them here.\n'
+            fi
+          mutates_checkout: false
+
+        # The loop body's only wait node, because a wait must be its body's sole terminal sink and
+        # a second one would have to be ordered against this one. At an `ask` round the labels
+        # read differently: `reply` keeps building with the answer, and `approve` finishes
+        # without answering, which the report line says.
+        - id: final_gate
+          depends_on: [report]
+          when: "$ready.output == 'pause' || $ready.output == 'ask'"
+          wait:
+            attention: |
+              $report.output
+            form: select
+            options:
+              - { id: approve, label: Deliver it }
+              - { id: rework, label: Another round with my note }
+              - { id: reply, label: Answer and keep building }
+
+  # Prints the delivery mode the run settled on, `land` or `draft-pr`, so a later node's
+  # `when:` tests one word. The loop ends at an approval at the final gate, or at a round that
+  # `ready` marked `auto`.
+  - id: ship_decision
+    depends_on: [build_cycle]
+    bash: |
+      set -uo pipefail
+      d=$("${ARCHON_HOME:-$HOME/.archon}/scripts/state.sh" get deliver)
+      [ -n "$d" ] || { printf 'no delivery mode was recorded\n' >&2; exit 1; }
+      printf '%s\n' "$d"
+    mutates_checkout: false
+
+  # deliver=draft-pr ends here instead of at `sync_cycle`: the branch is pushed, a draft pull
+  # request carries the evidence, and the run keeps its branch and worktree. Nothing in this
+  # graph comments on, reviews, readies or merges a pull request. Later feedback starts a new
+  # run.
+  #
+  # Idempotent, so a re-run of the same run edits the body of the draft it opened and does not
+  # fail on `gh pr create` with one already open for this head. Editing the body of its own
+  # draft is the only write this makes to a pull request. The body holds the plan, the gate
+  # table, the review, any test repairs and the mutation report; the node's stdout is the pull
+  # request's URL.
+  - id: deliver_pr
+    depends_on: [ship_decision]
+    when: "$ship_decision.output == 'draft-pr'"
+    timeout: 300000
+    bash: |
+      set -euo pipefail
+      base=$sync_base.output
+      verdict=$("${ARCHON_HOME:-$HOME/.archon}/scripts/state.sh" get review-verdict); verdict=${verdict:-unknown}
+      body=$(
+        cat "$ARTIFACTS_DIR/plan.md" 2>/dev/null || echo 'No plan artifact.'
+        printf '\n## Gates\n\n'
+        cat "$ARTIFACTS_DIR/gate-report.md" 2>/dev/null || echo 'No gate report.'
+        printf '\n## Review\n\nVerdict: %s\n\n' "$verdict"
+        cat "$ARTIFACTS_DIR/report.md" 2>/dev/null || echo 'No review report.'
+        if [ -f "$ARTIFACTS_DIR/test-repairs.md" ]; then
+          printf '\n## Test repairs\n\n'
+          cat "$ARTIFACTS_DIR/test-repairs.md"
+        fi
+        if [ -f "$ARTIFACTS_DIR/mutation-report.md" ]; then
+          printf '\n## Mutation check\n\n'
+          sed '1,/^$/d' "$ARTIFACTS_DIR/mutation-report.md"
+        fi
+        if [ -f "$ARTIFACTS_DIR/owner-notes.md" ]; then
+          printf '\n## Questions asked of the owner\n\n'
+          sed 's/^## /### /' "$ARTIFACTS_DIR/owner-notes.md"
+        fi
+        printf '\n## Commits\n\n'
+        git log --no-merges --pretty='- %s' "origin/$base..HEAD" || true
+        printf '\n---\nOpened as a draft by Archon build. Not yet reviewed by a human.\n'
+      )
+      branch=$(git rev-parse --abbrev-ref HEAD)
+      # push's "set up to track" line is stdout, and this node's stdout is the pull request's URL.
+      git push -u origin "$branch" >&2
+      url=$(gh pr list --head "$branch" --state open --json url --jq '.[0].url')
+      if [ -n "$url" ]; then
+        printf '%s\n' "$body" | gh pr edit "$url" --body-file - > /dev/null
+      else
+        url=$(printf '%s\n' "$body" | gh pr create --draft --base "$base" --head "$branch" \
+          --title "$(git log -1 --pretty=%s)" --body-file -)
+      fi
+      printf '%s\n' "$url"
+
+  # Landing is hands-off once the owner approves. Other builds land on the base branch while
+  # this one works, so each round rebases this branch onto the base's current tip, has an agent
+  # resolve any conflict, re-runs the gates on the rebased tree, and lands only if the base has
+  # not moved since the rebase. A round that cannot land (the base moved, or the gates were red
+  # and an agent fixed them) simply runs again, so the loop ends only when this branch is on the
+  # base. Exhausting the rounds fails the run and leaves the worktree for a person.
+  #
+  # An expected failure is a word and not an exit code, because a node that fails inside a
+  # loop_group fails the whole group. Nodes that follow a `when:` read the word of a node that
+  # always runs, since a condition on a skipped node fails the run. A refusal that no later round
+  # can fix, a dirty worktree after green gates or a second failed land, does fail the run, as
+  # `sync_gates` does.
+  - id: sync_cycle
+    depends_on: [ship_decision]
+    when: "$ship_decision.output == 'land'"
+    loop_group:
+      max_iterations: 8
+      fresh_context: true
+      until_bash: '[ -n "$("${ARCHON_HOME:-$HOME/.archon}/scripts/state.sh" get landed)" ]'
+      nodes:
+        # Leaves a rebase that stopped at a conflict in progress, for sync_resolve to finish.
+        # Also ends the previous round's sync_fix stage.
+        - id: sync_start
+          bash: |
+            set -uo pipefail
+            st="${ARCHON_HOME:-$HOME/.archon}/scripts/state.sh"
+            base=$sync_base.output
+            "${ARCHON_HOME:-$HOME/.archon}/scripts/lane.sh" unstage --verify || exit 1
+            "$st" set sync-base "$(git rev-parse "$base")"
+            "$st" set sync-pre "$(git rev-parse HEAD)"
+            if "${ARCHON_HOME:-$HOME/.archon}/scripts/run-log.sh" rebase git rebase "$base"; then
+              printf 'clean\n'
+            elif [ -d "$(git rev-parse --git-path rebase-merge)" ] || [ -d "$(git rev-parse --git-path rebase-apply)" ]; then
+              printf 'conflict\n'
+            else
+              printf 'refused\n'
+            fi
+
+        - id: sync_resolve
+          depends_on: [sync_start]
+          when: "$sync_start.output == 'conflict'"
+          model: medium
+          prompt: |
+            Other builds landed on $sync_base.output after this branch was cut, and rebasing this
+            branch onto it stopped at a conflict. The rebase is still in progress in this
+            worktree. Finish it. No person is available, and the run lands this branch as soon
+            as the gates pass.
+
+            Both sides are intentional work. In a rebase, "ours" is $sync_base.output, which holds
+            other builds' commits, and "theirs" is this run's commit being replayed. This run's
+            plan, $ARTIFACTS_DIR/plan.md, says what its side is for. The commits that landed
+            since this branch was cut are
+            `git log --stat "$(git merge-base "$(ARTIFACTS_DIR=$ARTIFACTS_DIR "${ARCHON_HOME:-$HOME/.archon}/scripts/state.sh" get sync-pre)" $sync_base.output)".."$sync_base.output"`;
+            read the ones that touch the conflicted files.
+
+            Resolve each conflict so that both sides keep doing what they were written to do.
+            Do not take one side wholesale unless the other side's change is entirely inside it.
+            Where both sides add to a list or a table, such as a source list, a registry of
+            apps, a documentation section or a test list, keep both additions. Never delete,
+            skip or weaken a test from either side. You may edit any file a conflict touches,
+            including .archon/gates.json, .archon/lanes.json, .archon/build.json and the paths in
+            the protected set of .archon/lanes.json (`bash "${ARCHON_HOME:-$HOME/.archon}/scripts/lane.sh" list
+            --set protected` prints them). In those files every line that differs from
+            $sync_base.output must be a line this branch's version had before the rebase, which
+            `git show "$(ARTIFACTS_DIR=$ARTIFACTS_DIR "${ARCHON_HOME:-$HOME/.archon}/scripts/state.sh" get sync-pre)":<file>`
+            prints. Keep lines from either side and never write a new line, because the next
+            stage stops the run and leaves the branch for a person otherwise.
+
+            For each resolved file run `git add` on it, then `GIT_EDITOR=true git rebase --continue`,
+            and repeat until `git status` shows no rebase in progress. Never run
+            `git rebase --abort` or `--skip` and never reset or push. Confirm that no conflict
+            marker is left: `git grep -n -E '^(<{7}|>{7})( |$)'` prints nothing. Do not run the
+            gates, because the next stage does.
+
+            Append to $ARTIFACTS_DIR/resolution.md, for each conflicted file, what each side
+            wanted and what you kept.
+          allowed_tools: [Read, Grep, Glob, Bash, Write, Edit]
+
+        # A rebase left in progress, or a guarded file (the protected set and the three
+        # .archon/*.json files) that a conflict resolution gave a line neither side wrote, is
+        # undone and fails the run at once with the files named, because another round would
+        # meet the same conflict. A conflict marker left in the tree is undone too and skips the
+        # round; the word is then `skipped`. A rebased
+        # tree runs the gates. sync_fix and sync_land compare this node's whole output with one
+        # word, so the gate table goes to run.log; run-gates.sh also writes gate-report.md for
+        # sync_fix.
+        #
+        # A clean rebase can still break the build, because two builds can be right alone and
+        # wrong together. On `red` this node tells lane-hook.mjs that the sync_fix stage is
+        # running, and the next round's `sync_start` ends it. The fix is committed, and the next
+        # round rebases and gates it again.
+        - id: sync_gates
+          depends_on: [sync_start, sync_resolve]
+          trigger_rule: all_done
+          timeout: 3600000
+          bash: |
+            set -uo pipefail
+            s=$sync_start.output
+            base=$sync_base.output
+            pre=$("${ARCHON_HOME:-$HOME/.archon}/scripts/state.sh" get sync-pre)
+            in_rebase() {
+              [ -d "$(git rev-parse --git-path rebase-merge)" ] || [ -d "$(git rev-parse --git-path rebase-apply)" ]
+            }
+            block() { printf '%s\n' "$1" >&2; exit 1; }
+            if [ "$s" = refused ]; then
+              printf 'skipped\n'
+              exit 0
+            fi
+            if in_rebase; then
+              files=$(git diff --name-only --diff-filter=U | paste -sd, -)
+              git rebase --abort > /dev/null 2>&1
+              git reset -q --hard "$pre"
+              block "the landing loop stopped: the conflict resolver left the rebase unfinished, conflicts in: ${files:-none listed}. The branch is back at $pre and the worktree is kept."
+            fi
+            if git diff --name-only "$base"..HEAD | xargs -r grep -l -E '^(<{7}|>{7})( |$)' > /dev/null 2>&1; then
+              git reset -q --hard "$pre"
+              printf 'skipped\n'
+              exit 0
+            fi
+            if [ "$s" = conflict ]; then
+              if ! bad=$(bash "${ARCHON_HOME:-$HOME/.archon}/scripts/sync-provenance.sh" "$base" "$pre"); then
+                git reset -q --hard "$pre"
+                block "the landing loop stopped: the conflict resolution wrote lines that neither side had into $(printf '%s' "$bad" | paste -sd, -). The branch is back at $pre and the worktree is kept."
+              fi
+            fi
+            if "${ARCHON_HOME:-$HOME/.archon}/scripts/run-log.sh" sync-gates bash "${ARCHON_HOME:-$HOME/.archon}/scripts/run-gates.sh" feature --clean-tree; then
+              printf 'green\n'
+            else
+              "${ARCHON_HOME:-$HOME/.archon}/scripts/lane.sh" stage sync_fix "$ARTIFACTS_DIR" || exit 1
+              printf 'red\n'
+            fi
+
+        - id: sync_fix
+          depends_on: [sync_gates]
+          when: "$sync_gates.output == 'red'"
+          model: medium
+          prompt: |
+            This run's commits are now rebased onto $sync_base.output, which holds the commits of
+            other builds that landed meanwhile, and the gates fail on the rebased tree. The
+            failure comes from the combination. No person is available, and the run lands this
+            branch as soon as the gates pass.
+
+            Read $ARTIFACTS_DIR/gate-report.md, which names each failing gate with its output,
+            $ARTIFACTS_DIR/plan.md, which says what this run is for, and
+            $ARTIFACTS_DIR/resolution.md when a conflict was resolved in this run. Find what
+            in the combination breaks and fix it.
+
+            Prefer to change the implementation. A test may change only when a build that
+            landed on $sync_base.output changed behaviour on purpose and the test asserts the old
+            behaviour, such as a golden frame after the title bar changed. Update it to the new
+            behaviour and never to something weaker, and never delete or skip a test. Do not
+            edit .archon/gates.json, .archon/lanes.json, .archon/build.json or any path in the
+            protected set of .archon/lanes.json, when it declares one: `bash
+            "${ARCHON_HOME:-$HOME/.archon}/scripts/lane.sh" list --set protected` prints its paths. A
+            hook refuses a write to them, and a write outside the worktree except to the temp
+            directory and $ARTIFACTS_DIR. The hook sees the Write and Edit tools and the common
+            shell forms; a script that writes there is still a violation. You may run the gates
+            yourself with `bash "${ARCHON_HOME:-$HOME/.archon}/scripts/run-gates.sh" feature`.
+
+            Commit with the message style `<subsystem>: <description>`. Uncommitted changes are
+            not delivered. Do not push. Put what you changed and why in the commit message
+            body, naming every test file you touched.
+          allowed_tools: [Read, Grep, Glob, Bash, Write, Edit]
+
+        # worktree-land rebases (a no-op here, since the base has not moved), cherry-picks onto the
+        # base branch and resets this branch. It changes the live checkout, so it takes the
+        # repository's git lock, the one other publish steps take too, and the check that
+        # the base has not moved sits inside that lock.
+        - id: sync_land
+          depends_on: [sync_gates]
+          bash: |
+            set -uo pipefail
+            st="${ARCHON_HOME:-$HOME/.archon}/scripts/state.sh"
+            g=$sync_gates.output
+            base=$sync_base.output
+            [ "$g" = green ] || { printf 'idle\n'; exit 0; }
+            dirty=$(git status --porcelain --untracked-files=all)
+            if [ -n "$dirty" ]; then
+              printf 'the landing loop stopped: the gates passed but left uncommitted changes, and worktree-land refuses a dirty worktree:\n%s\nThe worktree is kept.\n' "$dirty" >&2
+              exit 1
+            fi
+            mkdir -p "${ARCHON_HOME:-$HOME/.archon}/state"
+            repo=$("${ARCHON_HOME:-$HOME/.archon}/scripts/build-settings.sh" --repo)
+            exec 9> "${ARCHON_HOME:-$HOME/.archon}/state/$repo-git.lock"
+            flock 9
+            if [ "$(git rev-parse "$base")" != "$("$st" get sync-base)" ]; then
+              printf 'moved\n'
+              exit 0
+            fi
+            # A DEBUG trap in worktree-land (selected by $0 through BASH_ENV) records each command to a
+            # separate file; a failed landing appends its last 80 lines to the same run.log entry.
+            trace="$ARTIFACTS_DIR/land-trace.txt"
+            : > "$trace"
+            cat > "$ARTIFACTS_DIR/land-trace-env.sh" <<'TRACE'
+            case "${0##*/}" in
+              worktree-land)
+                set -T
+                trap 'printf "%s:%s: %s\n" "${BASH_SOURCE[0]##*/}" "$LINENO" "${BASH_COMMAND//$'"'"'\n'"'"'/ }" >> "$LAND_TRACE"' DEBUG ;;
+            esac
+            TRACE
+            if "${ARCHON_HOME:-$HOME/.archon}/scripts/run-log.sh" land bash -c '
+              BASH_ENV=$1 LAND_TRACE=$2 "$3"; s=$?
+              if [ "$s" -ne 0 ]; then printf "%s\n" "-- trace of worktree-land: its last 80 commands, one per line as file:line: command"; tail -n 80 "$2"; fi
+              exit "$s"' _ "$ARTIFACTS_DIR/land-trace-env.sh" "$trace" "${ARCHON_HOME:-$HOME/.archon}/scripts/worktree-land"; then
+              rc=0
+            else
+              rc=$?
+            fi
+            rm -f "$trace" "$ARTIFACTS_DIR/land-trace-env.sh"
+            if [ "$rc" -eq 0 ]; then
+              "$st" set landed yes; "$st" set land-failures 0
+              printf 'landed\n'
+            else
+              n=$("$st" get land-failures); n=$(( ${n:-0} + 1 )); "$st" set land-failures "$n"
+              tail -n 130 "$ARTIFACTS_DIR/run.log" >&2
+              if [ "$n" -ge 2 ]; then
+                printf 'the landing loop stopped: worktree-land failed %s rounds in a row; see run.log. The worktree is kept.\n' "$n" >&2
+                exit 1
+              fi
+              printf 'failed\n'
+            fi
+
+  # Starts the follow-up workflows the owner confirmed at the plan gate, after the change is
+  # delivered. A landing run's branch is deleted, so a workflow that takes `ref` gets the
+  # commit the base branch holds in the main checkout; a draft-pr run keeps its branch and
+  # passes its head. Each workflow starts detached, from the main checkout, and pauses for the
+  # owner by itself. A workflow that fails to start does not fail this run, because its change
+  # is already delivered; the line it prints says so. It follows whichever of the landing loop
+  # and the draft pull request ran, and the other is skipped.
+  - id: handoff
+    depends_on: [sync_cycle, deliver_pr]
+    trigger_rule: none_failed_min_one_success
+    bash: |
+      set -uo pipefail
+      kit="${ARCHON_HOME:-$HOME/.archon}/scripts"
+      base=$sync_base.output
+      how=$ship_decision.output
+      a="$ARTIFACTS_DIR/handoffs-approved.json"
+      m="$ARTIFACTS_DIR/publish-matched.json"
+      done_f="$ARTIFACTS_DIR/handoffs-started.json"
+      # An absent or unreadable file counts as an empty list.
+      rd() { if [ -s "$1" ] && jq -e 'type == "array"' "$1" > /dev/null 2>&1; then cat "$1"; else printf '[]\n'; fi; }
+      started=$(rd "$done_f")
+      todo=$( { rd "$a"; rd "$m"; } | jq -s -c --argjson started "$started" \
+        'add | unique_by([.workflow, .repo, .inputs]) as $u | $u | map(select(([.workflow, .repo, .inputs]) as $k | ($started | map([.workflow, .repo, .inputs]) | index([$k])) == null))' 2> /dev/null) || todo='[]'
+      if [ "$how" = draft-pr ]; then
+        while IFS= read -r line; do
+          [ -z "$line" ] || printf '%s\n' "$line"
+        done < <(printf '%s' "$todo" | jq -r '.[] | select(.workflow == "publish") | "skipped publish \(.inputs | map("\(.name)=\(.value)") | join(" ")): draft pull request"')
+        todo=$(printf '%s' "$todo" | jq -c 'map(select(.workflow != "publish"))')
+      fi
+      if [ "$(printf '%s' "$todo" | jq 'length')" -eq 0 ]; then printf 'no hand-offs\n'; exit 0; fi
+      main=$("$kit/build-settings.sh" --main-worktree) || exit 1
+      if [ "$how" = land ]; then sha=$(git -C "$main" rev-parse "$base") || exit 1; else sha=$(git rev-parse HEAD) || exit 1; fi
+      failed=0
+      one=$(mktemp)
+      while IFS= read -r entry; do
+        printf '[%s]\n' "$entry" > "$one"
+        out=$("$kit/start-run.sh" start --strict --retries 3 "$one" "$sha") || failed=1
+        printf '%s\n' "$out"
+        run=$(printf '%s\n' "$out" | sed -n 's/^started [^,]*, run //p' | head -n 1)
+        if [ -n "$run" ]; then
+          rd "$done_f" | jq -c --argjson e "$entry" --arg r "$run" '. + [{workflow: $e.workflow, repo: $e.repo, inputs: $e.inputs, run: $r}]' > "$done_f.tmp" \
+            && mv "$done_f.tmp" "$done_f"
+        fi
+      done < <(printf '%s' "$todo" | jq -c '.[]')
+      rm -f "$one"
+      [ "$failed" -eq 0 ] || exit 1
+    mutates_checkout: false
+
+  # Removes a landed run's worktree and branch. It runs last, because it deletes the directory
+  # this run is working in, and it follows `handoff`, which reads that worktree. A draft-pr run
+  # keeps both.
+  - id: cleanup
+    depends_on: [handoff]
+    when: "$ship_decision.output == 'land'"
+    bash: |
+      set -euo pipefail
+      base=$sync_base.output
+      branch=$(git rev-parse --abbrev-ref HEAD)
+      wt=$(git rev-parse --show-toplevel)
+      main_wt=$("${ARCHON_HOME:-$HOME/.archon}/scripts/build-settings.sh" --main-worktree)
+      git merge-base --is-ancestor HEAD "$base" || { printf '%s has commits %s lacks; leaving %s\n' "$branch" "$base" "$wt" >&2; exit 1; }
+      [ -z "$(git status --porcelain)" ] || { printf '%s has uncommitted changes; leaving it\n' "$wt" >&2; exit 1; }
+      cd "$main_wt"
+      git worktree remove --force "$wt"
+      git branch -D "$branch"
+      printf 'landed on %s; removed %s and branch %s\n' "$base" "$wt" "$branch"
+    mutates_checkout: false

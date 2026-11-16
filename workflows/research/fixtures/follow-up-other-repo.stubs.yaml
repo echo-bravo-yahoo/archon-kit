@@ -1,0 +1,17 @@
+# The work touches files in another repository where `build` can start, so the researcher
+# proposes `build` with `repo` set to its name. The stubs stand in for the check and the launch,
+# so this proves routing and the pause text; start-run.test.mjs covers the script.
+fixture:
+  expect: completed
+  reached: [sync_base, candidates, round, research, follow_plan, report_page, notice, decision, follow_up]
+  resolved-text-contains:
+    notice: "follow-up starts: build in alpha"
+sync_base: main
+candidates: "build — use when the work changes the repository's own files; it cannot change files outside this repository. Inputs to supply: none.\nbuild in alpha — use when the work changes alpha's own files, and set repo to alpha. Inputs to supply: none."
+round: research
+research: { confidence: confirmed, title: "Add the missing task", slug: missing-task, follow_ups: [{ workflow: build, repo: alpha, inputs: [], note: "alpha/tasks.js only" }] }
+follow_plan: build in alpha
+report_page: https://reports.example.net/myrepo/research-missing-task-000000/
+notice: { decision: follow-up, text: "go ahead" }
+decision: follow-up
+follow_up: "started build, run 00000000"

@@ -1,0 +1,16 @@
+# The dry run does one round of the loop, so this proves the routing: an answer of dig-deeper
+# starts no follow-up run. Archon does not run `until_bash` in a dry run, so the loop's
+# repetition is not covered.
+fixture:
+  expect: completed
+  reached: [sync_base, candidates, round, research, report_page, follow_plan, notice, decision]
+  resolved-text-contains:
+    notice: /research-dark-mode-tokens-000000/
+sync_base: main
+candidates: "build — use when the work changes the repository. Inputs to supply: none."
+round: research
+research: { confidence: likely, title: "Add a dark-mode token set", slug: dark-mode-tokens, follow_ups: [{ workflow: build, repo: "", inputs: [], note: "" }] }
+follow_plan: build
+report_page: https://reports.example.net/myrepo/research-dark-mode-tokens-000000/
+notice: { decision: dig-deeper, text: "follow the token pipeline into the build step" }
+decision: dig-deeper

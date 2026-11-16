@@ -1,0 +1,14 @@
+# follow_up's stub stands in for the launch, so this proves routing only.
+# start-run.test.mjs covers the script that starts the run.
+fixture:
+  expect: completed
+  reached: [sync_base, candidates, round, research, report_page, follow_plan, notice, decision, follow_up]
+sync_base: main
+candidates: "build — use when the work changes the repository. Inputs to supply: none."
+round: research
+research: { confidence: likely, title: "Add a dark-mode token set", slug: dark-mode-tokens, follow_ups: [{ workflow: build, repo: "", inputs: [], note: "" }] }
+follow_plan: build
+report_page: https://reports.example.net/myrepo/research-dark-mode-tokens-000000/
+notice: { decision: follow-up, text: "scope it to the contract only" }
+decision: follow-up
+follow_up: "started build run 00000000"

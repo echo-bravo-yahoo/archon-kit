@@ -1,0 +1,110 @@
+name: review-change
+description: |
+  Review the change on this branch against the base branch (base in .archon/build.json, main
+  when unset): correctness, whether the tests prove it, and what it breaks elsewhere. Writes
+  report.md and a one-word verdict, and changes nothing in the checkout. `build` includes it
+  as its reviewer block, so the prompt lives in one place, and it also runs alone.
+  Use when: a finished change needs a read before a person sees it.
+  Do not use when: the work is not committed to the branch yet.
+
+returns: review
+outcome_field: clean
+
+nodes:
+  # The merge-base, not the base tip: a diff against a base that moved under the
+  # branch reports other people's commits as this change's. Either copy of the base can be
+  # the stale one: origin lags a repository whose runs branch from the local base, and the
+  # local branch lags a run that branched from origin. The merge-base nearer to HEAD is the
+  # real fork point.
+  - id: scope
+    bash: |
+      set -uo pipefail
+      settings="${ARCHON_HOME:-$HOME/.archon}/scripts/build-settings.sh"
+      main=$("$settings" --main-worktree) || exit 1
+      base=$(cd "$main" && "$settings" base) || exit 1
+      mb=""; fewest=""
+      for b in "origin/$base" "$base"; do
+        git rev-parse --verify -q "$b" >/dev/null || continue
+        m=$(git merge-base "$b" HEAD) || continue
+        n=$(git rev-list --count "$m..HEAD")
+        if [ -z "$fewest" ] || [ "$n" -lt "$fewest" ]; then mb=$m; fewest=$n; fi
+      done
+      [ -n "$mb" ] || { printf 'no merge base with %s or origin/%s\n' "$base" "$base" >&2; exit 1; }
+      printf 'merge-base: %s\n\n' "$mb"
+      printf 'Commits:\n'; git log --no-merges --pretty='- %s' "$mb..HEAD"
+      printf '\nFiles:\n'; git diff --stat "$mb..HEAD"
+      printf '\nUncommitted:\n'; git status --short
+    mutates_checkout: false
+
+  - id: review
+    depends_on: [scope]
+    model: medium
+    prompt: |
+      Review the change on this branch. It is finished work: judge it, and change
+      nothing.
+
+      What the change is, including the merge-base to diff against:
+      $scope.output
+
+      Read the diff against that merge-base, then read enough of the surrounding
+      code to judge it. Read the repository's CLAUDE.md if it has one. When the run
+      that produced the change left a plan at $ARTIFACTS_DIR/plan.md, read that too
+      and judge the change against what it promised; when there is no plan, judge it
+      against what the commits say it does.
+
+      When $ARTIFACTS_DIR/owner-notes.md exists, it holds answers the owner gave during the run,
+      such as numbers they measured. Check what the change records of those answers (in
+      documentation, comments or tests) against the answers themselves. Record a blocking finding
+      when the change states a result that the answers contradict or do not support, such as a
+      cause the numbers do not show, and a note when it leaves out a caveat the answers carried.
+
+      When the plan at $ARTIFACTS_DIR/plan.md has an "Excused" section, the planner excused
+      this run from stages of the workflow. Judge each excuse against the diff. A red_check
+      excuse needs tests that pin behaviour the plan names. An implement excuse needs a diff with
+      no source change. A mutation_cycle excuse needs a diff that touches only Markdown files,
+      with no test or source change. Record a blocking finding when the diff does not fit its excuse. When
+      $ARTIFACTS_DIR/mutation-report.md exists, say for each mutation whether its edit really
+      breaks the behaviour its test pins.
+
+      Cover, in this order:
+
+      - Correctness. Name the input or the state that breaks it, not the smell.
+      - The tests. Do they assert the behaviour, or only the shape of the code that
+        happens to be there? What could an implementation get wrong without failing
+        one of them?
+      - What this change breaks outside its own diff.
+
+      When a plan exists at $ARTIFACTS_DIR/plan.md, this review runs inside a build, whose
+      gates run after it, so do not report a gate that has not run as a defect. List anything
+      you could not verify, such as a behaviour only a later step can show, under a final
+      `## Not verified` heading in report.md, one line each.
+
+      Write your findings as prose to $ARTIFACTS_DIR/report.md. Give each blocking
+      finding its file, its line and the failure it causes. Then return the verdict:
+      clean is true when nothing blocking is left. Style, naming, and anything you
+      would merge with a comment attached are notes, not blocking.
+
+      Change nothing in the repository, the tests included.
+    allowed_tools: [Read, Grep, Glob, Bash, Write]
+    mutates_checkout: false
+    output_format:
+      type: object
+      properties:
+        clean: { type: boolean }
+      required: [clean]
+
+  # The verdict goes into the run's state file, not a node output, because build's
+  # loop reads it from a bash condition on the other side of an `include:` boundary.
+  - id: verdict
+    depends_on: [review]
+    bash: |
+      set -uo pipefail
+      clean=$review.output.clean
+      case "$clean" in
+        true)  verdict=clean ;;
+        false) verdict=blocked ;;
+        *)     printf 'the review verdict did not resolve to a boolean: %s\n' "$clean" >&2; exit 1 ;;
+      esac
+      "${ARCHON_HOME:-$HOME/.archon}/scripts/state.sh" set review-verdict "$verdict"
+      printf '%s\n' "$verdict"
+    mutates_checkout: false

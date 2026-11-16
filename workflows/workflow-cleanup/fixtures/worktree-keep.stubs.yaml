@@ -1,0 +1,23 @@
+# The answer keep at the worktree pause leaves the worktree and records that it is kept.
+fixture:
+  expect: completed
+  inputs: { worktree: /w/wt-a, dry: "no", run: "", spend: "no" }
+  reached: [inspect, wt_inspect, wt_state, wt_assess, wt_judge, wt_page, wt_notice, wt_answer, wt_route, wt_act, state, facts, follow_candidates, decision, record, cleanup]
+inspect: worktree
+wt_inspect: assess
+wt_state: assess
+wt_assess: { verdict: abandon, reason: "It holds only an editor settings file.", slug: editor-settings-only }
+wt_judge: abandon
+wt_page: |
+  https://reports.example.net/myrepo/workflow-cleanup-editor-settings-only-000000/
+  Recommended: delete (the assessor found nothing worth keeping). Worktree wt-a (branch wt-a) holds 0 unlanded commits and 1 uncommitted file: It holds only an editor settings file.
+wt_notice: { decision: keep, text: "" }
+wt_answer: ""
+wt_route: keep
+wt_act: "kept /w/wt-a; it will not be assessed again unless it lands in main"
+state: worktree
+facts: none
+follow_candidates: none
+decision: none
+record: "nothing recorded"
+cleanup: "removed the worktree and its branch"

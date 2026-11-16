@@ -1,0 +1,27 @@
+# Archon install settings that the kit's workflows expect. install.sh copies this file to
+# $ARCHON_HOME/config.yaml when none exists, and never overwrites an existing one.
+#
+# Every workflow names a model tier (small, medium or large) and not a model, and this file pins
+# no tier, so each tier follows the default assistant. Switch every node with
+#   archon ai default codex
+# or run one workflow on another provider with `archon-kit run codex <workflow>`. See
+# docs/providers.md.
+defaultAssistant: claude
+
+assistants:
+  claude:
+    # Load only the repository's own Claude settings, not the user-level ones, so a run behaves
+    # the same on every machine.
+    settingSources: [project]
+  codex:
+    # Archon passes this to Codex. The research workflow needs a web search on Codex.
+    webSearchMode: live
+
+concurrency:
+  maxConversations: 10
+  providers:
+    claude: 10
+    codex: 10
+
+workflows:
+  autoResumeOnQuotaReset: true

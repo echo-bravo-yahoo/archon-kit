@@ -1,0 +1,7 @@
+[
+ {
+  "rule": "mutates_checkout on an include node",
+  "kind": "engine",
+  "note": "The engine rejects it on a top-level include node and accepts it inside a loop body. The page flags it as an error only at the top level."
+ }
+]

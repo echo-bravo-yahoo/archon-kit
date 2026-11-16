@@ -1,0 +1,9 @@
+# The per-run config layer for Claude: `archon workflow run <workflow> --config <this file>`, or
+# `archon-kit run claude <workflow>`. It sets the provider and all three tiers, because a layer for
+# one run has to win over an install that pins other models. The model names are the Archon 0.13.2
+# built-ins; `archon ai tier list` shows the current ones.
+assistant: claude
+tiers:
+  small: { provider: claude, model: haiku }
+  medium: { provider: claude, model: sonnet }
+  large: { provider: claude, model: opus }

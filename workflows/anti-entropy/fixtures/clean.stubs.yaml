@@ -1,0 +1,35 @@
+# The examiner finds nothing, so `check_eval` prints clean and the run skips the report page, the
+# pause and the build. `decision` prints none and `record` stores the subject as clean. Those
+# skipped nodes have no stubs, so reaching one fails the fixture.
+fixture:
+  expect: completed
+  reached:
+    [
+      sync_base,
+      declared,
+      inventory,
+      pick,
+      claim,
+      evaluate,
+      check_eval,
+      decision,
+      record,
+      cleanup,
+    ]
+  inputs: { focus: "" }
+sync_base: main
+declared: "feature: npm test"
+inventory: "tests  test/  12 files  never examined"
+pick:
+  { lens: tests, paths: ["test/"], reason: "never examined and the most churn" }
+claim:
+  "Subject: tests of test/ (12 files)\nEarlier runs on overlapping subjects: none"
+evaluate:
+  title: "Nothing to remove"
+  slug: nothing-to-remove
+  summary: "Every test pins behaviour no other test pins."
+  findings: []
+check_eval: clean
+decision: none
+record: "recorded clean"
+cleanup: "removed the worktree and its branch"

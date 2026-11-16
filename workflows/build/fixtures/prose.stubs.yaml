@@ -1,0 +1,60 @@
+# The planner excuses red_check and mutation_cycle for a brief that only changes prose. The tests
+# gate set passes, so `red_check` prints `prose`, `build_go` lets the loop start and the mutation
+# cycle is skipped: `mut_run`, `mut_fix` and `lane_mut` have no stubs, so reaching one fails the
+# fixture. `implement` runs and `impl_join` checks that only Markdown files changed.
+fixture:
+  expect: completed
+  reached: [sync_base, settings, reuse, tests, red_check, build_go, repair_ready, repair_state, implement, impl_join, report_pick, report, gates, shots, sync_start, sync_gates, sync_land, cleanup]
+  inputs: { design: timer }
+  resolved-text-contains:
+    final_gate: "Excused mutation_cycle"
+sync_base: main
+settings: docs/briefs
+slug_source: given
+intake: timer
+brief_location: docs/briefs/timer
+gates_declared: "feature: npm run lint, npm test"
+lanes_declared: ":(glob)test/**"
+base_gates: green
+handoffs_declared: none declared
+plan_round: plan
+spec:
+  summary: Corrects the install section of the README.
+  files: [README.md]
+  needs_decision: false
+  question: ""
+  excuses: [{ node: red_check, reason: "the brief changes prose only" }, { node: mutation_cycle, reason: "the brief changes prose only" }]
+  handoffs: []
+  gaps: []
+plan_record: no-ask
+plan_decision: approve
+tests_go: run
+tests: wrote nothing
+red_check: prose
+round: build
+impl_go: run
+implement: { ask: false, question: "", steps: "", handoffs: [] }
+impl_join: ok
+ask_mode: "no"
+plan_rules: none
+ask_check: go
+review_go: go
+review__scope: scoped
+review__review: { clean: true }
+review__verdict: clean
+gates: green
+reuse: fresh
+build_go: go
+repair_ready: no-repair
+repair_state: go
+ready: pause
+report_pick: { findings: "", open_items: [], summary: "Adds the change.", picks: [], extra_json: "" }
+report: "https://reports.example.net/myrepo/timer/review-report\ntimer is built, reviewed and green, and waits for you to land it.\nExcused red_check: the brief changes prose only\nExcused mutation_cycle: the brief changes prose only\nMore tests need another run: a rework note cannot add them here."
+shots: ""
+final_gate: { decision: approve, text: "" }
+ship_decision: land
+sync_start: clean
+sync_gates: green
+sync_land: landed
+handoff: no hand-offs
+cleanup: landed on main; removed the worktree

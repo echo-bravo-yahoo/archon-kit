@@ -1,0 +1,17 @@
+# The work touches files that the site repository publishes, so the researcher proposes
+# `publish-docs`, which starts in the site repository. The stubs stand in for the check and the
+# launch, so this proves routing and the pause text; start-run.test.mjs covers the script.
+fixture:
+  expect: completed
+  reached: [sync_base, candidates, round, research, follow_plan, report_page, notice, decision, follow_up]
+  resolved-text-contains:
+    notice: "follow-up starts: publish-docs"
+sync_base: main
+candidates: "build — use when the work changes the repository's own files; it cannot change files outside this repository. Inputs to supply: none.\npublish-docs — use when the work changes files that the site repository publishes, such as workflows, scripts and tests under ~/.config/site and docs under ~/.local/share/site. It starts in the site repository and runs no tests. Inputs to supply: none."
+round: research
+research: { confidence: confirmed, title: "Fix the landing loop", slug: landing-loop, follow_ups: [{ workflow: publish-docs, repo: "", inputs: [], note: "edit the workflow and its guide" }] }
+follow_plan: publish-docs
+report_page: https://reports.example.net/myrepo/research-landing-loop-000000/
+notice: { decision: follow-up, text: "go ahead" }
+decision: follow-up
+follow_up: "started publish-docs, run 00000000"

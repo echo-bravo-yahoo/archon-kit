@@ -1,0 +1,24 @@
+# The work touches three places, so the researcher proposes three follow-ups, each with the
+# note that scopes it. The stubs stand in for the check and the launch, so this proves routing
+# and the pause text; workflow-nodes.test.mjs and start-run.test.mjs cover the bash.
+fixture:
+  expect: completed
+  reached: [sync_base, candidates, round, research, follow_plan, report_page, notice, decision, follow_up]
+  resolved-text-contains:
+    notice: "follow-up starts: build in alpha, build in beta, publish-docs"
+sync_base: main
+candidates: "build — use when the work changes the repository's own files; it cannot change files outside this repository. Inputs to supply: none.\nbuild in beta — use when the work changes beta's own files, and set repo to beta. Inputs to supply: none.\nbuild in alpha — use when the work changes alpha's own files, and set repo to alpha. Inputs to supply: none.\npublish-docs — use when the work changes files that the site repository mirrors, such as workflows, scripts and tests under ~/.config/site and docs under ~/.local/share/site. It starts in the site repository and runs no tests. Inputs to supply: none."
+round: research
+research:
+  confidence: likely
+  slug: shared-task-key
+  title: "Rename the shared task key"
+  follow_ups:
+    - { workflow: build, repo: alpha, inputs: [], note: "the alpha task and its tests" }
+    - { workflow: build, repo: beta, inputs: [], note: "the beta reader" }
+    - { workflow: publish-docs, repo: "", inputs: [], note: "the doc in the site repository" }
+follow_plan: "build in alpha, build in beta, publish-docs"
+report_page: https://reports.example.net/myrepo/research-shared-task-key-000000/
+notice: { decision: follow-up, text: "go ahead" }
+decision: follow-up
+follow_up: "started build, run 00000000\nstarted build, run 11111111\nstarted publish-docs, run 22222222"

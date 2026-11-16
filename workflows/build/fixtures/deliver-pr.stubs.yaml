@@ -1,0 +1,58 @@
+# deliver=draft-pr. One build round is ready, the owner approves, and the run writes the pull
+# request body and pushes the branch in place of rebasing and landing. The cleanup that would
+# remove the worktree is skipped, because the run keeps its branch.
+# The stub stands in for the push and the pull request, so this proves routing only; a live
+# run proves the pull request opens.
+fixture:
+  expect: completed
+  reached: [sync_base, settings, reuse, build_go, report_pick, report, tests, red_check, implement, gates, ship_decision, deliver_pr, handoff]
+  inputs: { design: timer, deliver: draft-pr }
+  resolved-text-contains:
+    final_gate: waits for you to open its draft pull request
+sync_base: main
+settings: docs/briefs
+slug_source: given
+intake: timer
+brief_location: docs/briefs/timer
+gates_declared: "feature: npm run lint, npm test"
+lanes_declared: ":(glob)test/**"
+base_gates: green
+handoffs_declared: none declared
+plan_round: plan
+spec:
+  summary: Adds the timer feature.
+  files: [src/feature.js]
+  needs_decision: false
+  question: ""
+  excuses: []
+  handoffs: []
+  gaps: []
+plan_record: no-ask
+plan_decision: approve
+tests_go: run
+tests: wrote the tests
+red_check: red
+round: build
+impl_go: run
+implement: { ask: false, question: "", steps: "", handoffs: [] }
+impl_join: ok
+ask_mode: "no"
+plan_rules: none
+ask_check: go
+review_go: go
+review__scope: scoped
+review__review: { clean: true }
+review__verdict: clean
+gates: green
+reuse: fresh
+build_go: go
+repair_ready: no-repair
+repair_state: go
+ready: pause
+report_pick: { findings: "", open_items: [], summary: "Adds the change.", picks: [], extra_json: "" }
+report: "https://reports.example/site/slug/review-report\ntimer is built, reviewed and green, and waits for you to open its draft pull request."
+shots: ""
+final_gate: { decision: approve, text: "" }
+ship_decision: draft-pr
+deliver_pr: https://github.com/example/repo/pull/1
+handoff: no hand-offs

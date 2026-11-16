@@ -1,0 +1,18 @@
+# The researcher finds that staging only has to be redeployed, so it proposes `deploy-staging` from
+# the repository's declared hand-offs. `follow_plan` keeps the proposal, the pause names the
+# workflow, and the owner answers follow-up. The stubs stand in for the check and the launch,
+# so this proves routing and the pause text; start-run.test.mjs covers the script.
+fixture:
+  expect: completed
+  reached: [sync_base, candidates, round, research, follow_plan, report_page, notice, decision, follow_up]
+  resolved-text-contains:
+    notice: "follow-up starts: deploy-staging"
+sync_base: main
+candidates: "build — use when the work changes the repository. Inputs to supply: none.\ndeploy-staging — use when the change alters anything under src/ that staging runs. Inputs to supply: none."
+round: research
+research: { confidence: confirmed, title: "Deploy the current build", slug: stale-staging-build, follow_ups: [{ workflow: deploy-staging, repo: "", inputs: [], note: "staging runs a stale build" }] }
+follow_plan: deploy-staging
+report_page: https://reports.example.net/myrepo/research-stale-staging-build-000000/
+notice: { decision: follow-up, text: "go ahead" }
+decision: follow-up
+follow_up: "started deploy-staging, run 00000000"

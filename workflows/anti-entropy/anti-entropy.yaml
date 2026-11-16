@@ -1,0 +1,347 @@
+name: anti-entropy
+description: |
+  Look for one kind of accumulated debt in one part of this repository and offer to remove it
+  through build. A run picks one subject (or the one named in `focus`), examines it through one
+  lens, and writes a report. The lenses are tests (should some be combined, generalized or
+  removed), docs (are they correct, complete and useful) and structure (are the code's
+  boundaries and interfaces sound). When the run finds something it pauses with a link to the
+  report. Answer `build` to start a build run whose brief is the findings and your note, or
+  `close` to record the findings as declined. A run that finds nothing ends silently.
+  A memory of earlier runs, kept per repository under ~/.archon/state/anti-entropy/, steers the
+  choice of subject toward what was never examined or has changed since.
+  Use when: a bounded look at one area for debt is wanted. Start one run for each area.
+  Do not use when: the work is already decided (build), or a question needs an answer (research).
+
+inputs:
+  focus:
+    default: ""
+    description: "what to examine, in a few words: a path, a subsystem, or tests, docs or structure to fix the lens. Empty lets the run choose from what earlier runs left unexamined"
+
+nodes:
+  # Archon cuts a run's worktree from origin/<base>, which can lag the local branch. This run
+  # commits nothing, so it reads the local tip detached. The node's whole output is the base
+  # branch name.
+  - id: sync_base
+    bash: |
+      set -uo pipefail
+      settings="${ARCHON_HOME:-$HOME/.archon}/scripts/build-settings.sh"
+      main=$("$settings" --main-worktree) || exit 1
+      base=$(cd "$main" && "$settings" base) || exit 1
+      if git rev-parse --verify -q "refs/heads/$base" > /dev/null; then
+        git checkout -q --detach "$base" >&2 || exit 1
+      fi
+      printf '%s\n' "$base"
+
+  # A finding is handed to build, so a repository that build cannot run in is refused here,
+  # before any model spends anything.
+  - id: declared
+    depends_on: [sync_base]
+    bash: |
+      set -euo pipefail
+      printf 'Gates that decide whether a change ships (feature):\n'
+      bash "${ARCHON_HOME:-$HOME/.archon}/scripts/run-gates.sh" feature --list
+      printf '\nGates that run the tests (tests):\n'
+      bash "${ARCHON_HOME:-$HOME/.archon}/scripts/run-gates.sh" tests --list
+      printf '\nPaths that count as tests (the tests lane):\n'
+      bash "${ARCHON_HOME:-$HOME/.archon}/scripts/lane.sh" list
+      bash "${ARCHON_HOME:-$HOME/.archon}/scripts/lane.sh" verify
+    mutates_checkout: false
+
+  - id: inventory
+    depends_on: [declared]
+    bash: python3 -I "${ARCHON_HOME:-$HOME/.archon}/scripts/anti-entropy.py" inventory --out "$ARTIFACTS_DIR/inventory.json"
+    mutates_checkout: false
+
+  - id: pick
+    depends_on: [inventory]
+    model: medium
+    prompt: |
+      Choose the one subject this run will examine, and the one lens to examine it through. A
+      subject is a few tracked files or directories, and a lens is `tests`, `docs` or
+      `structure`. Later runs examine the others.
+
+      The requester's focus, empty when they gave none:
+      $INPUTS.focus
+
+      When the focus is not empty it decides the subject: resolve it to a lens and to paths
+      that cover what it names, using `git ls-files` to find them. When it is empty, choose
+      from the candidates below. They are ranked by how long ago an earlier run examined them,
+      how much they have changed since, and how large they are. The ranking is a starting
+      point. Take the candidate where a careful look is most likely to find debt worth a
+      build run, and give the reason in one sentence.
+
+      Candidates:
+      $inventory.output
+
+      Paths are relative to the repository root, and a directory ends with `/`. The subject
+      covers at most 60 tracked files, and every path must be tracked by git. For the tests
+      lens the paths are test files, for docs they are Markdown files, and for structure they
+      are source files. Change nothing, and return only the fields.
+    allowed_tools: [Read, Grep, Glob, Bash]
+    mutates_checkout: false
+    output_format:
+      type: object
+      properties:
+        lens: { type: string, enum: [tests, docs, structure] }
+        paths: { type: array, items: { type: string } }
+        reason: { type: string }
+      required: [lens, paths, reason]
+
+  # Validates the choice, prints the earlier runs that overlap it, and records the subject as
+  # picked, so a run that starts meanwhile in the same repository ranks it as just examined.
+  - id: claim
+    depends_on: [pick]
+    bash: |
+      set -euo pipefail
+      spec=$pick.output
+      printf '%s' "$spec" > "$ARTIFACTS_DIR/subject.json"
+      python3 -I "${ARCHON_HOME:-$HOME/.archon}/scripts/anti-entropy.py" claim --run "$(basename "$ARTIFACTS_DIR")" --subject "$ARTIFACTS_DIR/subject.json"
+    mutates_checkout: false
+
+  - id: evaluate
+    depends_on: [claim]
+    model: medium
+    prompt: |
+      Examine one part of this repository for debt through one lens, and report what is worth
+      removing. Debt is anything that costs readers or changers more than it gives: tests that
+      no longer earn their place, docs that mislead or repeat, structure that makes the next
+      change harder than it needs to be. A clean result is a valid result. Report a finding
+      only when removing the debt is clearly worth a build run, and return an empty list
+      otherwise.
+
+      The subject, and what earlier runs recorded about it:
+      $claim.output
+
+      Why this run chose it: $pick.output.reason
+      The subject's lens and paths are in $ARTIFACTS_DIR/subject.json.
+
+      Read the repository's CLAUDE.md and the docs it points to first. The repository's own
+      rules win over the guidance below. How this repository runs its tests, and what counts as
+      a test:
+      $declared.output
+
+      Follow the guidance for this run's lens and ignore the other two.
+
+      Lens tests. Read every test file in the subject and the code it exercises. For each
+      test, work out what behaviour it pins and what an implementation could get wrong without
+      failing it. Look for:
+      - tests that pin the same behaviour as another test, whole or in part (cite both, with
+        file and line);
+      - cases that differ only in their data and would read as one table-driven test;
+      - tests that assert how the code is built instead of what it does: mock call counts,
+        private helpers, constants copied from the source, snapshots of incidental output;
+      - tests that cannot fail: an assertion on a value the test just set, a catch that
+        swallows the failure, a skipped or commented-out test;
+      - tests whose failure would not say what broke, and tests that are slow or flaky for
+        what they pin.
+      For each finding say whether to merge, generalize or delete, and name the test that
+      keeps each behaviour pinned afterwards. Do not propose a test for behaviour that has none
+      unless one test would replace several. Run the tests gate set once to confirm the suite is
+      green before you judge it. A fresh worktree has no installed dependencies, so install
+      them first; they are git-ignored.
+
+      Lens docs. Read every doc in the subject and check it against the repository as it
+      stands.
+      - Correct: run or read the source for each command, path, flag, function name, number
+        and behaviour the doc claims. A claim you could not verify is not a finding. A claim
+        you disproved is one, with the evidence.
+      - Complete: what would a new contributor, or an agent given only this doc and the code,
+        need in order to do what the doc is for, that it does not say? What does the code do
+        that no doc mentions and a reader would trip on?
+      - Useful: does the doc say what the code already says better, repeat another doc,
+        narrate history instead of the present, or give instructions the repository enforces
+        by itself? Can a reader reach it from the index the repository uses to find docs?
+      Prefer shortening or deleting a doc to adding to it.
+
+      Lens structure. Read the subject's code and its callers.
+      - Boundaries: does each module have one reason to change? Look for code in the wrong
+        place, modules that know each other's internals, and cycles.
+      - Interfaces: look at the exported functions, CLI flags, file formats and config keys.
+        Look for inconsistent naming, argument lists that grow by position, return shapes that
+        differ between siblings, errors that cannot be told apart, and exports that nothing
+        outside the subject uses (count the callers with grep and state the count).
+      - Dead and duplicated code: unreferenced functions, files and options, flags that are
+        always on, and logic copied between files.
+      - Cost of the next change: where would a plausible next feature touch many files?
+      For each finding state the callers it affects, whether any behaviour changes, and what
+      the tests pin.
+
+      Every finding removes or simplifies something. Do not propose new features, an
+      abstraction with one user, a rename for taste, or formatting. Rank findings by the debt
+      removed against the risk of the change, and report at most five. Back each with evidence:
+      files and line numbers, counts, or command output. Say what you confirmed and what you
+      inferred. Skip a finding that an earlier run above recorded as declined or handed off,
+      unless the code has changed since in a way that matters.
+
+      Write $ARTIFACTS_DIR/report.md. The owner reads it as a web page and sees nothing else
+      from this run. Begin with `# <a short title>`, then the answer in a few sentences, then
+      the subject and the lens, how you examined it, each finding with its evidence, and what
+      you examined and found sound, so a later run need not repeat it. Use Markdown only: raw
+      HTML shows as text. A build run is handed the findings and this report as its brief, so
+      name files and line numbers and leave out the value of any secret.
+
+      Change nothing inside the repository. Write only under $ARTIFACTS_DIR. Return `title`,
+      a short imperative title for the work, such as 'Merge the overlapping retry tests', and
+      'Nothing to remove' when there are no findings. Return `slug`, two to five lowercase
+      words joined by hyphens that name what the report is about, such as 'retry-test-overlap'.
+      It becomes the report's address. Return `summary`, what you found, for the
+      person deciding whether to start a build. Return `findings`. Each has an `id` (F1, F2),
+      a `title`, the repository `files` it changes, the `change` to make stated concretely,
+      `keeps`, what must still hold afterwards (the behaviour, the test that still pins it, or
+      the doc claim that is still true), and its `risk`.
+    allowed_tools: [Read, Grep, Glob, Bash, Write]
+    mutates_checkout: false
+    output_format:
+      type: object
+      properties:
+        title: { type: string }
+        slug: { type: string, description: "two to five lowercase words joined by hyphens that name what the report is about, such as 'retry-test-overlap'" }
+        summary: { type: string }
+        findings:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              title: { type: string }
+              files: { type: array, items: { type: string } }
+              change: { type: string }
+              keeps: { type: string }
+              risk: { type: string, enum: [low, medium, high] }
+            required: [id, title, files, change, keeps, risk]
+      required: [title, slug, summary, findings]
+
+  # The findings list decides whether there is anything to report, not the examiner's mood, and
+  # the cap is applied here because the schema does not enforce it. Every run needs a report,
+  # so a clean run still records what it found sound.
+  - id: check_eval
+    depends_on: [evaluate]
+    bash: |
+      set -uo pipefail
+      e=$evaluate.output
+      f="$ARTIFACTS_DIR"
+      [ -s "$f/report.md" ] || { printf 'evaluate wrote no report at %s\n' "$f/report.md" >&2; exit 1; }
+      printf '%s' "$e" | jq -c '.findings |= .[:5]' > "$f/evaluation.json" || exit 1
+      if [ "$(jq '.findings | length' "$f/evaluation.json")" -gt 0 ]; then printf 'findings\n'; else printf 'clean\n'; fi
+    mutates_checkout: false
+
+  - id: headline
+    depends_on: [check_eval]
+    when: "$check_eval.output == 'findings'"
+    bash: |
+      set -uo pipefail
+      f="$ARTIFACTS_DIR"
+      lens=$(jq -r .lens "$f/subject.json")
+      paths=$(jq -r '.paths | join(", ")' "$f/subject.json")
+      jq -r --arg lens "$lens" --arg paths "$paths" \
+        '"\(.findings | length) finding(s) in the \($lens) of \($paths): " + (.findings | map(.title) | join("; "))' "$f/evaluation.json"
+    mutates_checkout: false
+
+  # report.sh builds the page: the repository's report_cmd when it has one, else the kit's page,
+  # else a plain one. A wait node's text does not resolve $ARTIFACTS_DIR, so the link is this
+  # node's output. The directory is named from the evaluator's `slug` (its title's words when that is
+  # empty), which check_eval saved in evaluation.json.
+  - id: report_page
+    depends_on: [check_eval]
+    when: "$check_eval.output == 'findings'"
+    bash: |
+      set -uo pipefail
+      f="$ARTIFACTS_DIR/report.md"
+      run=$(basename "$ARTIFACTS_DIR")
+      lens=$(jq -r .lens "$ARTIFACTS_DIR/subject.json")
+      slug=$(bash "${ARCHON_HOME:-$HOME/.archon}/scripts/slug.sh" make --run "$run" --prefix "anti-entropy-$lens" \
+        --model "$(jq -r '.slug // empty' "$ARTIFACTS_DIR/evaluation.json")" --text "$(jq -r '.title // empty' "$ARTIFACTS_DIR/evaluation.json")" \
+        --keep "$ARTIFACTS_DIR/slug.txt") || exit 1
+      out=$("${ARCHON_HOME:-$HOME/.archon}/scripts/build-settings.sh" --design-dir "$slug")/index.html
+      bash "${ARCHON_HOME:-$HOME/.archon}/scripts/report.sh" markdown anti-entropy --report "$f" --out "$out" --design "$slug" \
+        --run "$run" --artifacts "$ARTIFACTS_DIR" --status "Anti-entropy: $lens"
+    mutates_checkout: false
+
+  - id: notice
+    depends_on: [report_page, headline]
+    when: "$check_eval.output == 'findings'"
+    wait:
+      attention: |
+        $report_page.output
+        $headline.output
+        build starts with your note and the findings as its brief. Answer close to record them as declined.
+      form: select
+      options:
+        - { id: build, label: "Start a build with my note" }
+        - { id: close, label: "Close this, the findings are declined" }
+
+  - id: answer
+    depends_on: [notice]
+    when: "$check_eval.output == 'findings'"
+    bash: |
+      set -uo pipefail
+      d=$notice.output.decision
+      note=$notice.output.text
+      [ -n "$d" ] || d=close
+      printf '%s\n' "$d" > "$ARTIFACTS_DIR/decision.txt"
+      printf '%s' "$note" > "$ARTIFACTS_DIR/note.txt"
+    mutates_checkout: false
+
+  # Runs after a skipped `answer` (a clean run), so it takes none_failed_min_one_success and
+  # also depends on `check_eval`, which always succeeds.
+  - id: decision
+    depends_on: [check_eval, answer]
+    trigger_rule: none_failed_min_one_success
+    bash: cat "$ARTIFACTS_DIR/decision.txt" 2> /dev/null || printf 'none\n'
+    mutates_checkout: false
+
+  # build starts from the project's own checkout, so Archon cuts its worktree, and it receives
+  # the brief as its message. `intake` in build keeps the brief in the run's artifacts.
+  - id: start_build
+    depends_on: [decision]
+    when: "$decision.output == 'build'"
+    bash: |
+      set -euo pipefail
+      f="$ARTIFACTS_DIR"
+      python3 -I "${ARCHON_HOME:-$HOME/.archon}/scripts/anti-entropy.py" brief --subject "$f/subject.json" \
+        --evaluation "$f/evaluation.json" --report "$f/report.md" --note "$f/note.txt" > "$f/brief.md"
+      printf '[{"workflow":"build","inputs":[],"note":""}]\n' > "$f/build-plan.json"
+      settings="${ARCHON_HOME:-$HOME/.archon}/scripts/build-settings.sh"
+      main=$("$settings" --main-worktree)
+      base=$(cd "$main" && "$settings" base)
+      sha=$(git -C "$main" rev-parse "$base")
+      "${ARCHON_HOME:-$HOME/.archon}/scripts/start-run.sh" start --strict "$f/build-plan.json" "$sha" "$f/brief.md" | tee "$f/build-started.txt"
+    mutates_checkout: false
+
+  - id: record
+    depends_on: [decision, start_build]
+    trigger_rule: none_failed_min_one_success
+    bash: |
+      set -euo pipefail
+      f="$ARTIFACTS_DIR"
+      d=$decision.output
+      python3 -I "${ARCHON_HOME:-$HOME/.archon}/scripts/anti-entropy.py" record --run "$(basename "$f")" --decision "$d" \
+        --subject "$f/subject.json" --evaluation "$f/evaluation.json" --build-started "$f/build-started.txt"
+    mutates_checkout: false
+
+  # Removes the run's worktree and branch, which Archon keeps when a run completes. It runs last
+  # because it deletes the directory the run is working in, and only after `record` succeeded, so
+  # a run that failed anywhere earlier keeps its worktree for inspection. `sync_base` detached
+  # HEAD, so the branch Archon cut for the run is named by the worktree's directory. A run that
+  # left changes in its worktree keeps it, and so does a branch the base branch does not contain.
+  - id: cleanup
+    depends_on: [record]
+    trigger_rule: all_success
+    bash: |
+      set -euo pipefail
+      base=$sync_base.output
+      wt=$(git rev-parse --show-toplevel)
+      branch=$(basename "$wt")
+      main_wt=$("${ARCHON_HOME:-$HOME/.archon}/scripts/build-settings.sh" --main-worktree)
+      [ -z "$(git status --porcelain)" ] || { printf '%s has uncommitted changes; leaving it\n' "$wt" >&2; exit 1; }
+      cd "$main_wt"
+      git worktree remove --force "$wt"
+      if git rev-parse --verify -q "refs/heads/$branch" > /dev/null; then
+        if git merge-base --is-ancestor "$branch" "$base"; then
+          git branch -D "$branch" > /dev/null
+        else
+          printf 'branch %s has commits %s lacks; keeping it\n' "$branch" "$base" >&2
+        fi
+      fi
+      printf 'removed %s and branch %s\n' "$wt" "$branch"
+    mutates_checkout: false

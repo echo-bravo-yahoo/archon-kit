@@ -1,0 +1,7 @@
+defaults:
+  loadDefaultWorkflows: false
+  loadDefaultCommands: false
+
+# Without a base branch, every launch asks the remote for its default branch and Archon gives up after 10 s.
+worktree:
+  baseBranch: main

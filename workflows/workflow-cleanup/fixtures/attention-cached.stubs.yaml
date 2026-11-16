@@ -1,0 +1,23 @@
+# A pause whose facts were diagnosed at an earlier pause of the same run reuses that diagnosis: facts
+# prints cached and copies it, so `diagnose` makes no second model call. Its stub is left out, so
+# reaching it fails the fixture.
+fixture:
+  expect: completed
+  inputs: { run: "00000000-0000-0000-0000-000000000000", dry: "no", spend: "no" }
+  reached: [inspect, state, facts, follow_candidates, diagnosis, headline, report_page, notice, answer, decision, act, record, cleanup]
+inspect: attention
+state: attention
+facts: cached
+follow_candidates: "build — use when the work changes the repository's own files; it cannot change files outside this repository. Inputs to supply: none."
+diagnosis: cached
+headline: "The stage changed a file outside its lane. Recommended: follow-up."
+report_page: https://reports.example.net/myrepo/workflow-cleanup-build-000000/
+notice: { decision: accept, text: "" }
+answer: ""
+wt_state: none
+wt_judge: none
+wt_route: none
+decision: accept
+act: "removed /w/wt-00000000; branch wt-00000000 kept at abc1234"
+record: "recorded answered, accepted"
+cleanup: "removed the worktree and its branch"

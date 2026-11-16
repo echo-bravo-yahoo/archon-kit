@@ -1,0 +1,60 @@
+# An interactive run: the implementer asks the owner a question, so the round ends at the final
+# pause with the question as its message and runs neither the review, the gates, the screenshots
+# nor the report page. The owner answers `reply`. The stubs for `review_go`, `review__*`, `gates`,
+# `shots` and `report_pick` are left out on purpose, so reaching one fails the fixture. A dry run
+# does one round of the loop, so this proves the routing and not that the build carries on; the
+# repetition was probed with a copy of the graph.
+fixture:
+  expect: completed
+  reached: [ask_mode, plan_rules, ask_check, ready, report, final_gate]
+  inputs: { design: timer, interactive: "yes" }
+  resolved-text-contains:
+    final_gate: "Does the page show the new banner"
+sync_base: main
+settings: docs/briefs
+slug_source: given
+intake: timer
+brief_location: docs/briefs/timer
+gates_declared: "feature: npm run lint, npm test"
+lanes_declared: ":(glob)test/**"
+base_gates: green
+handoffs_declared: none declared
+plan_round: plan
+spec:
+  summary: Adds the timer feature.
+  files: [src/feature.js]
+  needs_decision: false
+  question: ""
+  excuses: []
+  handoffs: []
+  gaps: []
+plan_record: no-ask
+plan_decision: approve
+tests_go: run
+tests: wrote the tests
+red_check: red
+round: build
+impl_go: run
+implement:
+  ask: true
+  question: "Does the page show the new banner after the cache is cleared?"
+  steps: "1. Deploy the build.\n2. Open the page and say what it shows."
+  handoffs:
+    - { workflow: deploy-staging, inputs: [], note: "deploy-staging the experiment build" }
+impl_join: ok
+ask_mode: "yes"
+plan_rules: none
+ask_check: ask
+reuse: fresh
+build_go: go
+repair_ready: no-repair
+repair_state: go
+ready: ask
+report: "Does the page show the new banner after the cache is cleared?\n1. Deploy the build.\n2. Open the page and say what it shows.\nStarted: started deploy-staging, run run-deploy-staging-1\nreply keeps building with your answer. approve skips the question and finishes the work with what exists."
+final_gate: { decision: reply, text: "the page shows the new banner" }
+ship_decision: land
+sync_start: clean
+sync_gates: green
+sync_land: landed
+handoff: no hand-offs
+cleanup: landed on main; removed the worktree

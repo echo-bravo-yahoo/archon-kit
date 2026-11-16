@@ -1,0 +1,18 @@
+# The researcher finds that no listed workflow can change the files the work touches, so it
+# proposes none. `follow_plan` leaves the plan empty and the pause says `nothing`, and an answer
+# of follow-up starts no run. The stubs stand in for the check and the launch, so this proves
+# routing and the pause text; workflow-nodes.test.mjs covers the bash.
+fixture:
+  expect: completed
+  reached: [sync_base, candidates, round, research, follow_plan, report_page, notice, decision, follow_up]
+  resolved-text-contains:
+    notice: "follow-up starts: nothing"
+sync_base: main
+candidates: "build — use when the work changes the repository's own files; it cannot change files outside this repository. Inputs to supply: none."
+round: research
+research: { confidence: confirmed, title: "Act on research findings", slug: no-change-needed, follow_ups: [] }
+follow_plan: "nothing (no workflow was proposed)"
+report_page: https://reports.example.net/myrepo/research-no-change-needed-000000/
+notice: { decision: follow-up, text: "go ahead" }
+decision: follow-up
+follow_up: "no follow-up was proposed, so none started"

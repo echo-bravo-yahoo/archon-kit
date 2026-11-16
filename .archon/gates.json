@@ -1,0 +1,12 @@
+{
+  "feature": {
+    "parallel": [
+      "shellcheck -S warning install.sh uninstall.sh scripts/archon-kit scripts/git-retry scripts/worktree-land scripts/*.sh test/lane-hook-probe.sh test/codex-lane-probe.sh"
+    ],
+    "ordered": ["node --test test/*.test.mjs"]
+  },
+  "tests": {
+    "parallel": [],
+    "ordered": ["node --test test/*.test.mjs"]
+  }
+}

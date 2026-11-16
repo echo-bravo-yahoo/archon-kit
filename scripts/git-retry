@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# usage: git-retry [--wait SECONDS] [--stale SECONDS] [--] <command> [args...]
+#
+# Runs a command that writes a git repository, such as `git commit` or `git stash push`, and
+# waits out another process's lock on it. Git does not wait: when `index.lock` or a ref lock
+# exists it fails at once. Most of those locks are held for milliseconds by a background
+# `git status` (an editor, a prompt, another session) or by another writer, so the command
+# succeeds on a retry.
+#
+# Git reports a lock in two ways. Most commands say "Unable to create '<path>.lock': File
+# exists". Some say nothing useful: `git stash push` fails silently, and `git cherry-pick`
+# claims that local changes would be overwritten. So the script also treats a failure as a
+# lock failure when the repository's `index.lock` exists after it, and it waits for that lock
+# to clear before the first attempt. The repository is the one in a leading `git -C <dir>`,
+# or the current directory's.
+#
+# Only a lock failure is retried. Any other failure ends the command with its own status. A
+# lock failure happens before the command changes anything, so retrying the same command is
+# safe for a single git invocation. Do not wrap a shell function that runs several.
+#
+#   --wait SECONDS   how long to keep waiting on a held lock (default 90). 0 never waits, and
+#                    only removes a leftover lock.
+#   --stale SECONDS  a lock that no process has open and that is at least this old is a
+#                    leftover from a git process that died, and is removed (default 60)
+#
+# Exit status: the command's own, except 75 when the script gave up on a lock, which tells a
+# caller that the failure was contention and a later attempt may succeed.
+#
+# A running git holds its lock file open, so `fuser` tells a live lock from a leftover. A
+# process outside WSL, such as Windows git on a \\wsl.localhost path, is invisible to `fuser`,
+# which is why the default age is long. Without `fuser`, no lock is ever removed.
+set -uo pipefail
+
+wait_s=90
+stale_s=60
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --wait) wait_s=${2:?--wait needs a number}; shift 2 ;;
+    --stale) stale_s=${2:?--stale needs a number}; shift 2 ;;
+    --) shift; break ;;
+    -h|--help) sed -n '2,/^set -uo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) break ;;
+  esac
+done
+[ $# -gt 0 ] || { printf 'git-retry: no command given\n' >&2; exit 2; }
+
+# The git directory whose index the command writes.
+dir=.
+if [ "$(basename "$1")" = git ]; then
+  args=("${@:2}")
+  while [ "${#args[@]}" -gt 1 ] && [ "${args[0]}" = -C ]; do
+    case "${args[1]}" in /*) dir=${args[1]} ;; *) dir=$dir/${args[1]} ;; esac
+    args=("${args[@]:2}")
+  done
+fi
+gitdir=$(git -C "$dir" rev-parse --absolute-git-dir 2>/dev/null || true)
+index_lock=${gitdir:+$gitdir/index.lock}
+
+err=$(mktemp) || exit 2
+trap 'rm -f "$err"' EXIT
+deadline=$(( $(date +%s) + wait_s ))
+delay=0.2
+announced=
+have_fuser=$(if command -v fuser >/dev/null 2>&1; then echo 1; fi)
+
+# Returns 0 when the lock is gone or was a leftover that is now removed, so the caller can
+# go on at once, and 1 when it is live or too new to call a leftover.
+lock_cleared() {
+  local lock=$1 age mtime
+  [ -e "$lock" ] || return 0
+  [ -n "$have_fuser" ] || return 1
+  fuser -s "$lock" 2>/dev/null && return 1
+  # GNU stat takes -c; BSD and macOS stat take -f. On GNU, -f prints filesystem details, so it comes second and only a number counts.
+  mtime=$(stat -c %Y "$lock" 2>/dev/null || stat -f %m "$lock" 2>/dev/null)
+  case $mtime in '' | *[!0-9]*) mtime=$(date +%s) ;; esac
+  age=$(( $(date +%s) - mtime ))
+  [ "$age" -ge "$stale_s" ] || return 1
+  printf 'git-retry: removing %s, which no process holds and is %ss old\n' "$lock" "$age" >&2
+  rm -f "$lock"
+}
+
+# Waits until the lock is cleared or the deadline passes. Returns 1 at the deadline.
+wait_for() {
+  local lock=$1
+  while ! lock_cleared "$lock"; do
+    [ "$(date +%s)" -lt "$deadline" ] || return 1
+    [ -n "$announced" ] || printf 'git-retry: %s is locked; waiting up to %ss\n' "$lock" "$wait_s" >&2
+    announced=1
+    sleep "$delay"
+    delay=$(awk -v d="$delay" 'BEGIN { d *= 2; print (d > 2 ? 2 : d) }')
+  done
+}
+
+give_up() {
+  local lock=$1 holder
+  cat "$err" >&2
+  if [ "$wait_s" -gt 0 ]; then
+    holder=$(fuser -v "$lock" 2>&1 | tail -n +2 | head -3)
+    printf 'git-retry: gave up after %ss on %s%s\n' "$wait_s" "$lock" "${holder:+ (held by: $holder)}" >&2
+  fi
+  exit 75
+}
+
+# A lock that is there before the first attempt is waited for, not failed on.
+if [ -n "$index_lock" ] && [ -e "$index_lock" ] && [ "$wait_s" -gt 0 ]; then
+  wait_for "$index_lock" || true
+fi
+
+while :; do
+  "$@" 2>"$err"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    cat "$err" >&2
+    exit 0
+  fi
+  lock=$(sed -n "s/.*Unable to create '\(.*\.lock\)': File exists.*/\1/p" "$err" | head -1)
+  [ -n "$lock" ] || { [ -n "$index_lock" ] && [ -e "$index_lock" ] && lock=$index_lock; }
+  if [ -z "$lock" ]; then
+    cat "$err" >&2
+    exit "$rc"
+  fi
+  wait_for "$lock" || give_up "$lock"
+done

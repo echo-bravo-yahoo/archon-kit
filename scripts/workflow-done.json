@@ -1,0 +1,69 @@
+{
+  "build": {
+    "finish": [
+      [
+        "sync_cycle",
+        "deliver_pr"
+      ]
+    ],
+    "housekeeping": [
+      "cleanup"
+    ],
+    "git": "landed",
+    "land": {
+      "approval": "build_cycle.final_gate",
+      "state": "auto-land"
+    },
+    "adopt": true,
+    "attention_nodes": [
+      "gates_declared",
+      "lanes_declared"
+    ]
+  },
+  "anti-entropy": {
+    "finish": [
+      [
+        "record"
+      ]
+    ],
+    "housekeeping": [
+      "cleanup"
+    ],
+    "git": "none"
+  },
+  "research": {
+    "finish": [
+      [
+        "decision"
+      ]
+    ],
+    "git": "none"
+  },
+  "check-later": {
+    "finish": [
+      [
+        "verify"
+      ]
+    ],
+    "git": "none"
+  },
+  "review-change": {
+    "finish": [
+      [
+        "verdict"
+      ]
+    ],
+    "git": "none"
+  },
+  "publish": {
+    "finish": [
+      [
+        "verify"
+      ]
+    ],
+    "git": "none",
+    "effects": {
+      "run": "the published page or deployed service"
+    }
+  }
+}

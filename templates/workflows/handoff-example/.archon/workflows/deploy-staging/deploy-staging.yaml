@@ -1,0 +1,43 @@
+name: deploy-staging
+description: |
+  Build the commit that a build run delivered and, after you approve, deploy it to staging.
+  Use when: a change alters something that only a deploy can deliver.
+  Do not use when: nothing the change touched is deployed.
+
+# An example hand-off. `build` and `research` start it after you confirm it (see
+# build.json.sample for the declaration), and `ref` carries the commit that build delivered.
+inputs:
+  ref:
+    default: ""
+    description: "the commit to deploy; build supplies it when the declaration says pass_ref"
+
+nodes:
+  - id: build_artifact
+    bash: |
+      set -euo pipefail
+      ref=${INPUTS_REF:-HEAD}
+      git rev-parse --verify "$ref^{commit}" > /dev/null
+      printf 'would build %s here, for example: make build\n' "$(git rev-parse --short "$ref")"
+    mutates_checkout: false
+
+  # The approval keeps a person between a finished build and a deploy. The attention text is
+  # what you read at the pause.
+  - id: approve
+    depends_on: [build_artifact]
+    wait:
+      attention: |
+        The build of $INPUTS_REF succeeded. Deploy it to staging?
+
+        $build_artifact.output
+      form: select
+      options:
+        - { id: deploy, label: "Deploy to staging" }
+        - { id: skip, label: "Skip the deploy" }
+
+  - id: deploy
+    depends_on: [approve]
+    when: "$approve.output.decision == 'deploy'"
+    bash: |
+      set -euo pipefail
+      printf 'would deploy to staging here, for example: ./scripts/deploy.sh staging\n'
+    mutates_checkout: false

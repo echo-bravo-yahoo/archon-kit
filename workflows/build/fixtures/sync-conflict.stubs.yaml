@@ -1,0 +1,61 @@
+# After the owner approves, the rebase conflicts and an agent resolves it, the gates are red
+# on the rebased tree and an agent fixes them, and no one is asked. The dry run does one
+# round of the landing loop, so it proves the routing and not the repetition.
+fixture:
+  expect: completed
+  reached: [reuse, build_go, repair_ready, repair_state, report_pick, report, tests, red_check, implement, gates, shots, sync_start, sync_resolve, sync_gates, sync_fix, sync_land, cleanup]
+  inputs: { design: timer }
+  resolved-text-contains:
+    final_gate: waits for you to land it
+sync_base: main
+settings: docs/briefs
+slug_source: given
+intake: timer
+brief_location: docs/briefs/timer
+gates_declared: "feature: npm run lint, npm test"
+lanes_declared: ":(glob)test/**"
+base_gates: green
+handoffs_declared: none declared
+plan_round: plan
+spec:
+  summary: Adds the timer feature.
+  files: [src/feature.js]
+  needs_decision: false
+  question: ""
+  excuses: []
+  handoffs: []
+  gaps: []
+plan_record: no-ask
+plan_decision: approve
+tests_go: run
+tests: wrote the tests
+red_check: red
+round: build
+impl_go: run
+implement: { ask: false, question: "", steps: "", handoffs: [] }
+impl_join: ok
+ask_mode: "no"
+plan_rules: none
+ask_check: go
+review_go: go
+review__scope: scoped
+review__review: { clean: true }
+review__verdict: clean
+gates: green
+reuse: fresh
+build_go: go
+repair_ready: no-repair
+repair_state: go
+ready: pause
+report_pick: { findings: "", open_items: [], summary: "Adds the change.", picks: [], extra_json: "" }
+report: "https://reports.example.net/myrepo/timer/review-report\ntimer is built, reviewed and green, and waits for you to land it."
+shots: ""
+final_gate: { decision: approve, text: "" }
+ship_decision: land
+sync_start: conflict
+sync_resolve: resolved
+sync_gates: red
+sync_fix: fixed
+sync_land: idle
+handoff: no hand-offs
+cleanup: landed on main; removed the worktree

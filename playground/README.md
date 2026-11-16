@@ -24,7 +24,7 @@ The first command writes `$ARCHON_HOME/designs/archon/workflow-playground/index.
 
 `--label` and `--out` override it. A baseline page needs `--out` or an `out` here, because the default output file is the playground page itself. The page groups each workflow by the directory under `workflows/` that holds it, so a workflow that moved from `personal` to `kit` shows as moved.
 
-`build.py` needs Python 3 with PyYAML. It reads `$ARCHON_HOME/workflows/<group>/<name>/<name>.yaml` for every group (`personal`, `kit`, and so on) and `~/workspace/<repo>/.archon/workflows/<name>/<name>.yaml`. It opens `$ARCHON_HOME/archon.db` read-only and shows no statistics when the database is missing.
+`build.py` needs Python 3 with PyYAML. It reads `$ARCHON_HOME/workflows/<group>/<name>/<name>.yaml` for every group (`personal`, `kit`, and so on) and `<workspace>/<repo>/.archon/workflows/<name>/<name>.yaml`, where `<workspace>` is the `workspace` setting of `$ARCHON_HOME/kit.json` (default `~/workspace`; a `kit.json` that is not a JSON object stops the build). It opens `$ARCHON_HOME/archon.db` read-only and shows no statistics when the database is missing.
 
 The page draws each file a workflow creates as a row in a pane under the graph, with a dot under every node that writes, reads or deletes it. `data/files.json` lists the scripts known to write files. A script missing from it needs a rule there before its files appear.
 

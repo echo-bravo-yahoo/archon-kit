@@ -5,7 +5,8 @@ usage: build.py [--out FILE] [--dump FILE] [--no-link] [--baseline DIR [--label 
 
 `bash refresh.sh` (or `archon-kit playground`) runs this for the playground page and for the before/after page.
 
-Reads the workflow YAML files and the Archon database (read-only), then writes the page to
+Reads the workflow YAML files of the Archon home and of the repositories in the workspace (the `workspace` setting of
+$ARCHON_HOME/kit.json, default ~/workspace) and the Archon database (read-only), then writes the page to
 $ARCHON_HOME/designs/archon/workflow-playground/index.html (ARCHON_HOME defaults to ~/.archon), where the
 report server serves it. data/aliases.json, annotations.json, findings.json and findings-note.txt, and a
 baseline directory, hold one person's data and are not committed; the page builds without them.
@@ -58,10 +59,28 @@ EVENT_TYPES = (
 )
 
 
-def find_workflow_files(root=HOME, baseline=False):
-    """Workflow files: the Archon home's (workflows/<group>/<name>/<name>.yaml, such as personal and kit groups) and a
-    workspace's repositories', or with `baseline` the layout under `root` that --baseline describes."""
-    patterns = [os.path.join(root, p) for p in ("personal/*/*.yaml", "repo/*/*/*.yaml")] if baseline else [os.path.join(WORKFLOWS_DIR, "*", "*", "*.yaml"), os.path.join(root, "workspace/*/.archon/workflows/*/*.yaml")]
+def workspace_dir():
+    """The directory that holds the repositories, the `workspace` setting of kit.json. scripts/kit-settings.sh in this
+    clone reads it, so the setting's default and its error for a kit.json that is not an object stay in one place."""
+    script = os.path.join(os.path.dirname(ROOT), "scripts", "kit-settings.sh")
+    try:
+        got = subprocess.run(["bash", script, "workspace"], capture_output=True, text=True, timeout=30, env={**os.environ, "ARCHON_HOME": ARCHON_HOME})
+    except (OSError, subprocess.SubprocessError) as e:
+        sys.exit(f"cannot read the workspace setting with {script}: {e}")
+    if got.returncode != 0:
+        sys.exit(got.stderr.strip() or f"{script} workspace exited with {got.returncode}")
+    return got.stdout.strip()
+
+
+def find_workflow_files(root=None, baseline=False):
+    """Workflow files: the Archon home's (workflows/<group>/<name>/<name>.yaml, such as personal and kit groups) and the
+    workspace's repositories' (<root>/<repo>/.archon/workflows/<name>/<name>.yaml, with `root` the workspace), or with
+    `baseline` the layout under `root` that --baseline describes."""
+    if baseline:
+        patterns = [os.path.join(root, p) for p in ("personal/*/*.yaml", "repo/*/*/*.yaml")]
+    else:
+        root = root or workspace_dir()
+        patterns = [os.path.join(WORKFLOWS_DIR, "*", "*", "*.yaml"), os.path.join(root, "*", ".archon", "workflows", "*", "*.yaml")]
     personal, repos = (sorted(glob.glob(pattern)) for pattern in patterns)
     return [p for p in personal + repos if "/worktrees/" not in "/" + os.path.relpath(p, root)]
 
@@ -102,7 +121,11 @@ def leading_comments(text):
     return by_id, nodes_comment
 
 
-def load_workflow(path, root=HOME, baseline=False):
+def load_workflow(path, root=None, baseline=False):
+    """One workflow. `root` is the workspace, which defaults to the setting of kit.json, or with `baseline` the
+    baseline directory, which the caller gives."""
+    if root is None and not baseline:
+        root = workspace_dir()
     with open(path, "rb") as f:
         raw = f.read()
     text = raw.decode("utf-8")
@@ -110,7 +133,7 @@ def load_workflow(path, root=HOME, baseline=False):
     comments, nodes_comment = leading_comments(text)
     rel = os.path.relpath(path, root).split(os.sep)
     personal = rel[0] == "personal" if baseline else path.startswith(WORKFLOWS_DIR + os.sep)
-    repo = None if personal else rel[1]
+    repo = None if personal else rel[1 if baseline else 0]
     group = (rel[0] if baseline else os.path.relpath(path, WORKFLOWS_DIR).split(os.sep)[0]) if personal else None
     return {
         "name": model["name"],
@@ -448,7 +471,10 @@ def main():
     if args.label and not args.baseline:
         ap.error("--label needs --baseline")
 
-    workflows = [load_workflow(p) for p in find_workflow_files()]
+    workspace = workspace_dir()
+    if not os.path.isdir(workspace):
+        print(f"note: the workspace {workspace} is not a directory, so no repository's workflows are drawn", file=sys.stderr)
+    workflows = [load_workflow(p, workspace) for p in find_workflow_files(workspace)]
     baseline = load_baseline(args.baseline) if args.baseline else None
     cfg = load_baseline_config(args.baseline) if args.baseline else {}
     label = args.label or cfg.get("label") or (os.path.basename(os.path.normpath(args.baseline)) if args.baseline else "")

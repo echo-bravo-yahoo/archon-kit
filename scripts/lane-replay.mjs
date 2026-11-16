@@ -41,14 +41,16 @@ const HOME = os.homedir();
 const ARCHON_HOME = process.env.ARCHON_HOME || path.join(HOME, ".archon");
 const ws = path.join(ARCHON_HOME, "workspaces", "_local", REPO);
 // The directory that holds the repositories is the `workspace` setting of kit.json.
+// kit-settings.sh refuses a kit.json that is not a JSON object, and so does this script.
 const workspace = (() => {
   try {
-    return execFileSync("bash", [path.join(ARCHON_HOME, "scripts", "kit-settings.sh"), "workspace"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
-  } catch {
-    return "";
+    return execFileSync("bash", [path.join(ARCHON_HOME, "scripts", "kit-settings.sh"), "workspace"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  } catch (e) {
+    console.error(String(e.stderr || e.message).trim());
+    process.exit(1);
   }
 })();
-const checkout = path.join(workspace || path.join(HOME, "workspace"), REPO);
+const checkout = path.join(workspace, REPO);
 const esc = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 // A run's worktree: Archon's own layout, or the older ~/.archon/builds/<repo>-<slug> that the
 // queue-started builds used.

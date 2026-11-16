@@ -245,7 +245,8 @@ MUTATIONS = [
 def main():
     write_gaps = "--write-gaps" in sys.argv
     verbose = "-v" in sys.argv
-    workflows = {w["name"]: w["model"] for w in (build.load_workflow(p) for p in build.find_workflow_files())}
+    workspace = build.workspace_dir()
+    workflows = {w["name"]: w["model"] for w in (build.load_workflow(p, workspace) for p in build.find_workflow_files(workspace))}
     for p in sorted(glob.glob(os.path.join(FIXTURES, "*.yaml"))):
         with open(p) as f:
             model = yaml.safe_load(f)
